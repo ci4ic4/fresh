@@ -5,8 +5,8 @@
 
 use crate::config::{
     ClipboardConfig, CursorStyle, FileBrowserConfig, FileExplorerConfig, FormatterConfig,
-    Keybinding, KeybindingMapName, KeymapConfig, LanguageConfig, LineEndingOption, OnSaveAction,
-    PluginConfig, TerminalConfig, ThemeName, WarningsConfig,
+    Keybinding, KeybindingMapName, KeymapConfig, LanguageConfig, LineEndingOption, LiveDiffConfig,
+    OnSaveAction, PluginConfig, TerminalConfig, ThemeName, WarningsConfig,
 };
 use crate::types::LspLanguageConfig;
 use serde::{Deserialize, Serialize};
@@ -82,6 +82,7 @@ pub struct PartialConfig {
     pub file_browser: Option<PartialFileBrowserConfig>,
     pub clipboard: Option<PartialClipboardConfig>,
     pub terminal: Option<PartialTerminalConfig>,
+    pub live_diff: Option<PartialLiveDiffConfig>,
     pub keybindings: Option<Vec<Keybinding>>,
     pub keybinding_maps: Option<HashMap<String, KeymapConfig>>,
     pub active_keybinding_map: Option<KeybindingMapName>,
@@ -111,6 +112,7 @@ impl Merge for PartialConfig {
         merge_partial(&mut self.file_browser, &other.file_browser);
         merge_partial(&mut self.clipboard, &other.clipboard);
         merge_partial(&mut self.terminal, &other.terminal);
+        merge_partial(&mut self.live_diff, &other.live_diff);
         merge_partial(&mut self.warnings, &other.warnings);
         merge_partial(&mut self.packages, &other.packages);
         // Env detectors: higher precedence replaces the whole list.
@@ -444,6 +446,20 @@ impl Merge for PartialTerminalConfig {
         self.skip_app_execution_alias
             .merge_from(&other.skip_app_execution_alias);
         self.resume_agents.merge_from(&other.resume_agents);
+    }
+}
+
+/// Partial Live Diff plugin configuration.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PartialLiveDiffConfig {
+    pub enabled_on_startup: Option<bool>,
+}
+
+impl Merge for PartialLiveDiffConfig {
+    fn merge_from(&mut self, other: &Self) {
+        self.enabled_on_startup
+            .merge_from(&other.enabled_on_startup);
     }
 }
 
@@ -956,6 +972,24 @@ impl PartialTerminalConfig {
     }
 }
 
+impl From<&LiveDiffConfig> for PartialLiveDiffConfig {
+    fn from(cfg: &LiveDiffConfig) -> Self {
+        Self {
+            enabled_on_startup: Some(cfg.enabled_on_startup),
+        }
+    }
+}
+
+impl PartialLiveDiffConfig {
+    pub fn resolve(self, defaults: &LiveDiffConfig) -> LiveDiffConfig {
+        LiveDiffConfig {
+            enabled_on_startup: self
+                .enabled_on_startup
+                .unwrap_or(defaults.enabled_on_startup),
+        }
+    }
+}
+
 impl From<&WarningsConfig> for PartialWarningsConfig {
     fn from(cfg: &WarningsConfig) -> Self {
         Self {
@@ -1093,6 +1127,7 @@ impl From<&crate::config::Config> for PartialConfig {
             file_browser: Some(PartialFileBrowserConfig::from(&cfg.file_browser)),
             clipboard: Some(PartialClipboardConfig::from(&cfg.clipboard)),
             terminal: Some(PartialTerminalConfig::from(&cfg.terminal)),
+            live_diff: Some(PartialLiveDiffConfig::from(&cfg.live_diff)),
             keybindings: Some(cfg.keybindings.clone()),
             keybinding_maps: Some(cfg.keybinding_maps.clone()),
             active_keybinding_map: Some(cfg.active_keybinding_map.clone()),
@@ -1303,6 +1338,10 @@ impl PartialConfig {
                 .terminal
                 .map(|e| e.resolve(&defaults.terminal))
                 .unwrap_or_else(|| defaults.terminal.clone()),
+            live_diff: self
+                .live_diff
+                .map(|e| e.resolve(&defaults.live_diff))
+                .unwrap_or_else(|| defaults.live_diff.clone()),
             keybindings: self
                 .keybindings
                 .unwrap_or_else(|| defaults.keybindings.clone()),
