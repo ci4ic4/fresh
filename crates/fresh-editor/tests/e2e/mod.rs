@@ -150,6 +150,7 @@ pub mod open_folder;
 pub mod orchestrator_dock;
 pub mod orchestrator_window_lsp;
 pub mod overlay_extend_to_line_end;
+pub mod overwrite_mode;
 #[cfg(feature = "plugins")]
 pub mod panel_mode_window_switch_leak;
 pub mod paste;

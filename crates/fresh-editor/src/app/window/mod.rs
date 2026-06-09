@@ -521,6 +521,10 @@ pub struct Window {
     /// for buffers in this window.
     pub auto_revert_enabled: bool,
 
+    /// Whether overwrite (type-over) mode is active: typed characters
+    /// replace the character under the cursor instead of inserting.
+    pub overwrite_mode: bool,
+
     /// Tracks rapid file-change events for debouncing the auto-revert
     /// reload trigger.
     pub file_rapid_change_counts: HashMap<PathBuf, (std::time::Instant, u32)>,
@@ -1838,6 +1842,7 @@ impl Window {
             live_grep_last_state: None,
             overlay_preview_state: None,
             auto_revert_enabled: true,
+            overwrite_mode: false,
             file_rapid_change_counts: HashMap::new(),
             goto_line_preview: None,
             pending_async_prompt_callback: None,
