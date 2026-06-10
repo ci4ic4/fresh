@@ -2824,6 +2824,8 @@ pub fn action_to_events(
         | Action::SaveAs
         | Action::Open
         | Action::SwitchProject
+        | Action::OpenRecentProject
+        | Action::TogglePinProject
         | Action::New
         | Action::Close
         | Action::CloseTab

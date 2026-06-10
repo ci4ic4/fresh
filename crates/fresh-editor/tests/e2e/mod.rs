@@ -166,6 +166,7 @@ pub mod preview_lsp_popup_focus;
 pub mod preview_tabs;
 pub mod prompt;
 pub mod prompt_editing;
+pub mod recent_projects;
 pub mod recovery;
 pub mod remote_fs_test;
 pub mod remote_indicator_popup;
