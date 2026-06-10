@@ -1140,6 +1140,21 @@ impl crate::app::window::Window {
         }
         state.buffer_settings.whitespace = whitespace;
 
+        // Apply `.editorconfig` overrides. Project-level indentation settings
+        // take precedence over the language/global defaults resolved above.
+        // Resolved through the FileSystem abstraction so it also works on
+        // remote hosts; matched against the canonical on-disk path.
+        let editorconfig = crate::services::editorconfig::resolve_for_file(
+            self.authority().filesystem.as_ref(),
+            &canonical_path,
+        );
+        if let Some(use_tabs) = editorconfig.use_tabs {
+            state.buffer_settings.use_tabs = use_tabs;
+        }
+        if let Some(tab_size) = editorconfig.tab_size {
+            state.buffer_settings.tab_size = tab_size;
+        }
+
         // Apply line_numbers default from config
         state
             .margins
