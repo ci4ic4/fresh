@@ -2822,6 +2822,7 @@ pub fn action_to_events(
         | Action::Detach
         | Action::Save
         | Action::SaveAs
+        | Action::SaveAll
         | Action::Open
         | Action::SwitchProject
         | Action::New
