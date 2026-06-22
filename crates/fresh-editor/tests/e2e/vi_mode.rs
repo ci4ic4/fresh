@@ -374,10 +374,23 @@ fn test_vi_vim_compat_repeat_change_word_keeps_change_semantics() {
     send_vi_operator_motion(&mut harness, 'c', 'W');
     harness.type_text("X").unwrap();
     harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
-    harness.render().unwrap();
-    harness.assert_buffer_content("X three four.five\n");
+    // Esc finalizes the change through the async command pipeline; wait for the
+    // buffer to settle rather than reading it after a single render (semantic
+    // waiting, per CONTRIBUTING.md §3).
+    harness.wait_for_buffer_content("X three four.five\n").unwrap();
 
+    // Move to the next WORD, then repeat. Wait for the cursor to actually
+    // advance before sending `.`: `send_vi_key` only fires the key and renders
+    // once, so without this wait the `.` repeat can replay the recorded change
+    // while the cursor is still on the first WORD — the buffer then never
+    // reaches "X X four.five" and the wait below hangs until the external
+    // nextest timeout (the observed flake).
+    let pos_before_w = harness.cursor_position();
     send_vi_key(&mut harness, 'W');
+    harness
+        .wait_until(|h| h.cursor_position() > pos_before_w)
+        .unwrap();
+
     send_vi_key(&mut harness, '.');
 
     // The `.` repeat replays the recorded change (cW → insert "X" → Esc)
