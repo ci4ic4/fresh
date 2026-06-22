@@ -1725,6 +1725,17 @@ impl Editor {
                 // for the same reason.
                 self.active_window_mut().key_context =
                     crate::input::keybindings::KeyContext::Normal;
+                // Quick Open, the Open File prompt and Live Grep are all
+                // explicit "take me to this file" gestures, so reveal the
+                // freshly opened file in the explorer — expanding its
+                // ancestor directories and selecting it — when the explorer
+                // is open. This is independent of `follow_active_buffer`
+                // (which governs passive following as you cycle tabs): an
+                // explicit jump should always reveal its target. The call is
+                // a no-op when the explorer is closed, and de-dupes against a
+                // follow-triggered sync via `file_explorer_sync_in_progress`.
+                // (issue #2365)
+                self.active_window_mut().sync_file_explorer_to_active_file();
                 self.set_status_message(
                     t!("buffer.opened", name = full_path.display().to_string()).to_string(),
                 );
