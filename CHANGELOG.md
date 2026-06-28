@@ -30,6 +30,7 @@ For live updates on Fresh, [follow me on X](https://x.com/TheNoamLewis).
 
 ### Bug Fixes
 
+* **Vi mode**: the indent operators `>>` / `<<` (with counts and motions like `>j`) and visual-mode `>` / `<` now shift lines by one level instead of doing nothing; `.` repeats them (#2438).
 * **Regex search**: `^` / `$` now anchor per line in multi-line `Ctrl+F` search (#2495).
 * **Splits**: closing a buffer shown in two splits no longer desyncs the surviving cursor (#2496).
 * **Terminal**: a terminal restores its live/scrollback mode on refocus, and the last split is no longer left read-only after closing a second terminal (#2485).
