@@ -441,6 +441,19 @@ pub(crate) fn render_content(
                 &view_prefs.rulers
             };
 
+            // Indentation guides are likewise a source-code editing aid. Buffer-
+            // group panels (e.g. the Git Log commit list and its commit-detail
+            // diff) and standalone virtual buffers (grep results, *Diagnostics*,
+            // …) aren't code surfaces, so a guide glyph in their first column
+            // reads as a stray artifact rather than structure. Suppress it there.
+            // This is deliberately independent of the line-number / fold-indicator
+            // gutter: a user may turn line numbers off yet still want guides in
+            // real code, so the guides stay for ordinary buffers either way.
+            let mut style = style;
+            if is_inner_group_leaf || is_virtual_buffer {
+                style.cfg.indentation_guide = IndentationGuideMode::None;
+            }
+
             let mut empty_folds = FoldManager::new();
             let folds = split_view_states
                 .as_deref_mut()
