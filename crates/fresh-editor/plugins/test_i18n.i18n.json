@@ -1,8 +1,8 @@
 {
   "bg": {
-    "cmd.test": "Test Localized Command",
-    "cmd.test_desc": "A command to test plugin localization",
-    "msg.hello": "Hello, %{name}! Your locale is %{locale}."
+    "cmd.test": "Тестова локализирана команда",
+    "cmd.test_desc": "Команда за тестване локализацията на приставки",
+    "msg.hello": "Здравейте, %{name}! Вашият език е %{locale}."
   },
   "cs": {
     "cmd.test": "Testovací lokalizovaný příkaz",
