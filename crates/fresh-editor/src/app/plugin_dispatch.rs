@@ -933,6 +933,14 @@ impl Editor {
             } => {
                 self.handle_start_prompt_async(label, initial_value, callback_id);
             }
+            PluginCommand::StartFilePickAsync {
+                label,
+                directory,
+                show_hidden,
+                callback_id,
+            } => {
+                self.handle_start_file_pick_async(label, directory, show_hidden, callback_id);
+            }
             PluginCommand::AwaitNextKey { callback_id } => {
                 self.handle_await_next_key(callback_id);
             }
@@ -1698,6 +1706,50 @@ impl Editor {
                 self.handle_signal_window(id, &signal);
             }
 
+            PluginCommand::RegisterDiffBaseline {
+                buffer_id,
+                kind,
+                git_ref,
+                callback_id,
+            } => {
+                self.handle_register_diff_baseline(buffer_id, kind, git_ref, callback_id);
+            }
+
+            PluginCommand::DiffAgainstBaseline {
+                buffer_id,
+                baseline_id,
+                callback_id,
+            } => {
+                self.handle_diff_against_baseline(buffer_id, baseline_id, callback_id);
+            }
+
+            PluginCommand::DiffBaselinePair {
+                old_baseline_id,
+                new_baseline_id,
+                callback_id,
+            } => {
+                self.handle_diff_baseline_pair(old_baseline_id, new_baseline_id, callback_id);
+            }
+
+            PluginCommand::GetBaselineLines {
+                baseline_id,
+                ranges,
+                callback_id,
+            } => {
+                self.handle_get_baseline_lines(baseline_id, ranges, callback_id);
+            }
+
+            PluginCommand::RefreshDiffBaseline {
+                baseline_id,
+                callback_id,
+            } => {
+                self.handle_refresh_diff_baseline(baseline_id, callback_id);
+            }
+
+            PluginCommand::ReleaseDiffBaseline { baseline_id } => {
+                self.handle_release_diff_baseline(baseline_id);
+            }
+
             PluginCommand::GrepProject {
                 pattern,
                 fixed_string,
@@ -2176,6 +2228,23 @@ impl Editor {
         self.split_manager_mut().set_active_split(dock_leaf);
         self.active_window_mut()
             .set_pane_buffer(dock_leaf, buffer_id);
+        // `show_line_numbers` is per (split, buffer), and the dock leaf's view
+        // state already exists — it was built for whichever panel opened the
+        // dock — so it defaults this buffer to "on". Fresh-split creation sets
+        // it explicitly; this path did not, which is why the *second* panel
+        // routed into the dock (a second tour, diagnostics beside
+        // search/replace) rendered with a line-number gutter the first one
+        // lacked. The gutter also stole the columns the panel had already laid
+        // its widgets out for, so the content wrapped.
+        if let Some(view_state) = self
+            .windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_view_states_mut())
+            .expect("active window must have a populated split layout")
+            .get_mut(&dock_leaf)
+        {
+            view_state.ensure_buffer_state(buffer_id).show_line_numbers = show_line_numbers;
+        }
         // Drop the phantom tab from the source split.
         if dock_leaf != source_split_before_create {
             if let Some(source_view_state) = self
@@ -2561,7 +2630,7 @@ impl Editor {
     }
 
     /// Normalize a plugin-supplied `BufferId`: treat id 0 as "use the active buffer".
-    fn resolve_buffer_id(&self, buffer_id: BufferId) -> BufferId {
+    pub(super) fn resolve_buffer_id(&self, buffer_id: BufferId) -> BufferId {
         if buffer_id.0 == 0 {
             self.active_buffer()
         } else {
@@ -4023,7 +4092,7 @@ impl Editor {
                 persistent,
                 command: command.clone(),
                 title: title.filter(|t| !t.is_empty()),
-                env: terminal_env,
+                env: terminal_env.clone(),
             };
             let spawned = target.create_plugin_terminal(spec);
             // Record the launch/resume argv exactly as `create_window_with_terminal`
@@ -4033,6 +4102,9 @@ impl Editor {
             // respawned a bare shell instead of the agent.
             if let Ok((terminal_id, _, _)) = &spawned {
                 target.mark_terminal_restorable(*terminal_id, command, resume);
+                // File the token this terminal's child was handed, so workspace
+                // capture persists the grant and a restore re-mints it.
+                target.record_terminal_script_token(*terminal_id, &terminal_env);
             }
             spawned
         };
@@ -4669,7 +4741,7 @@ impl Editor {
         let prev = std::collections::HashMap::new();
         let prev_focus = String::new();
         let panel_width = self.widget_panel_width(buffer_id);
-        let out = crate::widgets::render_spec(&spec, &prev, &prev_focus, panel_width);
+        let out = self.render_panel_spec(&spec, &prev, &prev_focus, panel_width);
         let focus_cursor = out.focus_cursor;
         self.widget_registry.mount(
             panel_key.clone(),
@@ -4679,6 +4751,7 @@ impl Editor {
             out.instance_states,
             out.focus_key,
             out.tabbable,
+            out.scroll_regions,
         );
         // Mark the buffer as hosting an interactive widget panel so the
         // focus/click paths keep routing focus to it even when it opts out
@@ -4735,7 +4808,7 @@ impl Editor {
             .map(|(b, _)| b)
             .unwrap_or(BufferId(0));
         let panel_width = self.widget_panel_width(buffer_id_for_width);
-        let out = crate::widgets::render_spec(&spec, &prev, &prev_focus, panel_width);
+        let out = self.render_panel_spec(&spec, &prev, &prev_focus, panel_width);
         let focus_cursor = out.focus_cursor;
         let entries = out.entries;
         match self.widget_registry.update(
@@ -4745,6 +4818,7 @@ impl Editor {
             out.instance_states,
             out.focus_key,
             out.tabbable,
+            out.scroll_regions,
         ) {
             Ok(buffer_id) => {
                 if let Err(e) = self.set_virtual_buffer_content(buffer_id, entries.clone()) {
@@ -4811,6 +4885,7 @@ impl Editor {
                                 completion_selected_index,
                                 completion_scroll_offset,
                                 completion_navigated,
+                                ..
                             }) => (
                                 *scroll,
                                 editor.multiline,
@@ -4840,6 +4915,7 @@ impl Editor {
                             completion_selected_index: sel_idx,
                             completion_scroll_offset: scroll_off,
                             completion_navigated: navigated,
+                            user_scrolled: false,
                         },
                     );
                 }
@@ -5179,6 +5255,7 @@ impl Editor {
             title: if as_dock { None } else { title },
             closable: !as_dock && closable,
             close_button_rect: None,
+            hovered_widget_key: String::new(),
             dropdown_popup: None,
             dropdown_popup_hits: Vec::new(),
             dropdown_popup_rect: None,
@@ -5186,13 +5263,24 @@ impl Editor {
         let prev = std::collections::HashMap::new();
         let prev_focus = String::new();
         let panel_width = self.floating_panel_inner_width(slot);
-        let out = super::widget_runtime::render_floating_spec(
-            focus_marker,
-            &spec,
-            &prev,
-            &prev_focus,
-            panel_width,
-        );
+        // A fresh mount has nothing hovered: the pointer hasn't been
+        // resolved against this panel's hit areas yet, and the next
+        // `Moved` event will do so.
+        let out = {
+            let theme_guard = self.theme.read().unwrap();
+            super::widget_runtime::render_floating_spec(
+                focus_marker,
+                &spec,
+                &prev,
+                &prev_focus,
+                panel_width,
+                "",
+                Some(crate::widgets::MarkdownCtx {
+                    theme: &theme_guard,
+                    grammars: Some(self.grammar_registry.as_ref()),
+                }),
+            )
+        };
         let focus_cursor = out.focus_cursor;
         let entries = out.entries;
         let embeds = out.embeds;
@@ -5207,6 +5295,7 @@ impl Editor {
             out.instance_states,
             out.focus_key,
             out.tabbable,
+            scroll_regions.clone(),
         );
         if let Some(fwp) = self.panel_mut(slot) {
             fwp.entries = entries;
@@ -5256,13 +5345,27 @@ impl Editor {
             .unwrap_or_default();
         let panel_width = self.floating_panel_inner_width(slot);
         let focus_marker = self.panel(slot).map(|f| f.focus_marker).unwrap_or(false);
-        let out = super::widget_runtime::render_floating_spec(
-            focus_marker,
-            &spec,
-            &prev,
-            &prev_focus,
-            panel_width,
-        );
+        // Carry the live hover through a plugin-driven update, so a spec
+        // refresh under a stationary pointer doesn't drop the highlight.
+        let hover_key = self
+            .panel(slot)
+            .map(|f| f.hovered_widget_key.clone())
+            .unwrap_or_default();
+        let out = {
+            let theme_guard = self.theme.read().unwrap();
+            super::widget_runtime::render_floating_spec(
+                focus_marker,
+                &spec,
+                &prev,
+                &prev_focus,
+                panel_width,
+                &hover_key,
+                Some(crate::widgets::MarkdownCtx {
+                    theme: &theme_guard,
+                    grammars: Some(self.grammar_registry.as_ref()),
+                }),
+            )
+        };
         let focus_cursor = out.focus_cursor;
         let entries = out.entries;
         let embeds = out.embeds;
@@ -5278,6 +5381,7 @@ impl Editor {
                 out.instance_states,
                 out.focus_key,
                 out.tabbable,
+                scroll_regions.clone(),
             )
             .is_err()
         {

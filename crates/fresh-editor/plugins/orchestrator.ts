@@ -72,9 +72,16 @@ type CompletionItem = { value: string; kind?: "history" };
 interface AgentSession {
   // Editor's stable session id.
   id: number;
+  // Durable workspace identity (`ws-…`) reported by the host window.
+  // Unlike `root` it distinguishes co-tenant workspaces sharing one
+  // project root (e.g. a tab extracted to a new workspace), so manual
+  // renames are keyed by it. Undefined for rows without a live window
+  // (discovered worktrees, pending placeholders) and for legacy
+  // workspace files that predate stable ids.
+  stableId?: string;
   // Resolved display name shown in the dock / picker. Computed by
   // `workspaceDisplayName` from three sources, most-specific first: a
-  // manual rename (`renameWorkspace`, persisted per root), else an
+  // manual rename (`renameWorkspace`, persisted per workspace), else an
   // auto-name tracking the terminal's tab title (constant workspace
   // prefix + the terminal/process title), else `hostLabel`.
   label: string;
@@ -795,6 +802,11 @@ const DOCK_MIN_WIDTH_COLS = 24;
 const DOCK_MAX_WIDTH_COLS = 40;
 // Fraction of the terminal width the dock targets by default.
 const DOCK_WIDTH_FRACTION = 0.28;
+// Glyph on the dock's title-bar hide button. `×` (U+00D7), the same
+// multiplication sign the file explorer's close button and the host's
+// native modal `[×]` use — not the ASCII letter x — so all three close
+// affordances read identically.
+const DOCK_CLOSE_GLYPH = "×";
 
 // Responsive default dock width: ~`DOCK_WIDTH_FRACTION` of the terminal,
 // clamped to [`DOCK_MIN`..`DOCK_MAX`]. Re-evaluated on resize so the dock
@@ -951,11 +963,15 @@ function configuredHideTrivial(): boolean {
 // lists every project's sessions, so the organisation is global, not
 // per-project) and persist across restarts.
 //
-// A session is assigned by its *canonical root path*, not its numeric
-// window id: the id churns (a discovered on-disk worktree carries a
-// synthetic negative id that becomes a positive window id the moment it
-// is opened) and isn't stable run-to-run, whereas the root is the
-// session's durable identity (§3 of orchestrator-sessions.md).
+// A session is assigned by a durable key, not its numeric window id:
+// the id churns (a discovered on-disk worktree carries a synthetic
+// negative id that becomes a positive window id the moment it is
+// opened) and isn't stable run-to-run. The durable key is the window's
+// stable id when the host reports one (`stableIdKey` — co-tenant
+// workspaces share a root, so a per-root key would file them all
+// together), falling back to the canonical root path for windowless
+// rows and entries written before stable-id keying (§3 of
+// orchestrator-sessions.md).
 // =============================================================================
 
 interface DockFolder {
@@ -1053,9 +1069,27 @@ function sessionNodeKey(id: number): string {
   return SESSION_NODE_PREFIX + id;
 }
 
-// The durable key a session is filed under (see the section header).
-function sessionAssignKey(s: AgentSession): string {
-  return normRoot(s.root);
+// Durable store key for a workspace-scoped entry (manual name, folder
+// assignment). Keyed by the host's stable id: co-tenant workspaces (a
+// tab extracted to a new workspace) share one root, so a per-root key
+// would apply the entry to all of them at once. The bare root remains
+// both the legacy key (entries written before stable-id keying) and the
+// only key available for rows without a live window (discovered
+// worktrees).
+function stableIdKey(stableId: string): string {
+  return "id:" + stableId;
+}
+
+// Whether another live workspace co-tenants `s`'s root. When one does, a
+// legacy per-root store entry may still describe *that* workspace, so
+// writers must leave it alone — touching it is the "renaming the
+// extracted workspace renamed the original too" bug, and its
+// move-to-folder twin.
+function hasLiveCoTenant(s: AgentSession): boolean {
+  const rootKey = normRoot(s.root);
+  return [...orchestratorSessions.values()].some(
+    (o) => o.id !== s.id && !o.discovered && o.id > 0 && normRoot(o.root) === rootKey,
+  );
 }
 
 function folderById(id: string): DockFolder | undefined {
@@ -1077,10 +1111,17 @@ function childFoldersOf(parent: string | null): DockFolder[] {
 
 // The folder a live session is filed under, or null when it is unfiled
 // or its folder was deleted out from under it (treated as top level).
+// The session's own stable-id entry wins; an empty string there is an
+// explicit "top level" (recorded when unfiling next to a co-tenant, so
+// the legacy per-root entry can't pull the row back into a folder).
+// Only a session with no entry of its own falls back to the legacy /
+// windowless per-root entry.
 function folderOfSession(id: number): string | null {
   const s = orchestratorSessions.get(id);
   if (!s) return null;
-  const a = loadAssign()[sessionAssignKey(s)];
+  const assign = loadAssign();
+  const own = s.stableId ? assign[stableIdKey(s.stableId)] : undefined;
+  const a = own !== undefined ? own : assign[normRoot(s.root)];
   return a && folderById(a) ? a : null;
 }
 
@@ -1174,7 +1215,7 @@ function sessionLastActiveDay(s: AgentSession): number {
 // ── Workspace names: manual rename + terminal-tracking auto-name ─────────
 //
 // A workspace's display name comes from three sources, most-specific first:
-//   1. a manual rename (persisted per canonical root, survives restarts),
+//   1. a manual rename (persisted per workspace, survives restarts),
 //   2. else, when it has a terminal that reports a title, an auto-name that
 //      tracks that terminal: a constant prefix (the workspace's own name, so
 //      you can still tell which workspace it is) + the changing terminal/
@@ -1206,9 +1247,20 @@ function saveNames(): void {
   editor.setGlobalState(WORKSPACE_NAMES_KEY, (dockNames ?? {}) as unknown as object);
 }
 
-// The manual name pinned to this session's root, if any.
+// The manual name pinned to a workspace, if any: its own stable-id entry
+// first, else the legacy / windowless per-root entry.
+function customNameFor(stableId: string | undefined, root: string): string | undefined {
+  const store = loadNames();
+  if (stableId) {
+    const own = store[stableIdKey(stableId)];
+    if (own) return own;
+  }
+  return store[normRoot(root)];
+}
+
+// The manual name pinned to this session, if any.
 function workspaceCustomName(s: AgentSession): string | undefined {
-  return loadNames()[normRoot(s.root)];
+  return customNameFor(s.stableId, s.root);
 }
 
 // Compute the display name for a session from the three sources above.
@@ -1234,11 +1286,27 @@ function applyResolvedLabel(s: AgentSession): void {
 // refresh its resolved label. Clearing lets the auto-name / host label take
 // over again.
 function renameWorkspace(s: AgentSession, name: string): void {
-  const key = normRoot(s.root);
+  const rootKey = normRoot(s.root);
   const store = loadNames();
   const trimmed = name.trim();
-  if (trimmed) store[key] = trimmed;
-  else delete store[key];
+  if (s.stableId) {
+    const idKey = stableIdKey(s.stableId);
+    if (trimmed) store[idKey] = trimmed;
+    else delete store[idKey];
+    // Keep the per-root entry in step when it can only mean this
+    // workspace, so root-keyed lookups (a later discovered row at this
+    // root, a legacy workspace file) agree with the rename / clear.
+    // With a co-tenant present the entry may still name *that*
+    // workspace, so it is left alone — touching it is exactly the
+    // "renaming the extracted workspace renamed the original too" bug.
+    if (!hasLiveCoTenant(s)) {
+      if (trimmed) store[rootKey] = trimmed;
+      else delete store[rootKey];
+    }
+  } else {
+    if (trimmed) store[rootKey] = trimmed;
+    else delete store[rootKey];
+  }
   saveNames();
   applyResolvedLabel(s);
 }
@@ -1272,9 +1340,27 @@ function assignSessionToFolder(id: number, folderId: string | null): void {
   const s = orchestratorSessions.get(id);
   if (!s) return;
   const assign = loadAssign();
-  const key = sessionAssignKey(s);
-  if (folderId) assign[key] = folderId;
-  else delete assign[key];
+  const rootKey = normRoot(s.root);
+  if (s.stableId) {
+    const idKey = stableIdKey(s.stableId);
+    const coTenant = hasLiveCoTenant(s);
+    if (folderId) assign[idKey] = folderId;
+    // Unfiling next to a co-tenant records an explicit "top level" ("")
+    // rather than deleting the entry — a bare delete would fall back to
+    // the co-tenant's legacy per-root entry and the move wouldn't stick.
+    else if (coTenant) assign[idKey] = "";
+    else delete assign[idKey];
+    // Keep the per-root entry in step when it can only mean this
+    // workspace, so root-keyed lookups (a later discovered row at this
+    // root, a legacy workspace file) agree with the move.
+    if (!coTenant) {
+      if (folderId) assign[rootKey] = folderId;
+      else delete assign[rootKey];
+    }
+  } else {
+    if (folderId) assign[rootKey] = folderId;
+    else delete assign[rootKey];
+  }
   saveAssign();
 }
 
@@ -1739,7 +1825,8 @@ function reconcileSessions(): void {
       if (remote) pendingRemoteFacet = null;
       orchestratorSessions.set(s.id, {
         id: s.id,
-        label: loadNames()[normRoot(s.root)] ?? s.label,
+        stableId: s.stable_id || undefined,
+        label: customNameFor(s.stable_id || undefined, s.root) ?? s.label,
         hostLabel: s.label,
         root: s.root,
         projectPath: s.project_path,
@@ -1755,7 +1842,9 @@ function reconcileSessions(): void {
       });
     } else {
       // Track the host's raw label, then re-resolve the display name (a
-      // manual rename or terminal auto-name overrides it).
+      // manual rename or terminal auto-name overrides it). The stable id
+      // is adopted first — the manual-name lookup is keyed by it.
+      existing.stableId = s.stable_id || undefined;
       existing.hostLabel = s.label;
       applyResolvedLabel(existing);
       existing.root = s.root;
@@ -1874,7 +1963,7 @@ async function refreshDiscoveredWorktrees(): Promise<void> {
         } else {
           orchestratorSessions.set(id, {
             id,
-            label: loadNames()[normRoot(wt.path)] ?? label,
+            label: customNameFor(undefined, wt.path) ?? label,
             hostLabel: label,
             root: wt.path,
             projectPath: listed.mainRoot,
@@ -4107,18 +4196,40 @@ function dockTitleRow(): WidgetSpec {
   } else {
     segments.push({ text: title, style: { ...base, bold: true } });
   }
-  // Pad to the screen width so the menu-bar background spans the whole
-  // dock; the host clips the over-wide row to the actual dock columns.
-  const barW = Math.max(title.length, editor.getScreenSize().width || 80);
-  return {
-    kind: "raw",
-    entries: [
-      styledRow(segments as Parameters<typeof styledRow>[0], {
-        padToChars: barW,
-        style: base,
-      }),
-    ],
-  };
+  // Title on the left, the `[ × ]` hide button hard against the right
+  // edge, and a flex spacer between them. The spacer is sized by the host
+  // against the dock's *actual* content width (including a user drag), so
+  // the button stays pinned to the edge without the plugin guessing the
+  // width — the previous "pad past the screen width and let the host clip"
+  // trick can't right-align anything, since the clipped tail is exactly
+  // where the button would sit.
+  //
+  // The bar background rides on the first inline piece's whole-entry
+  // `style`: a Row's inline collapse keeps the leading child's entry style
+  // for the merged line (and each child's own overlays on top of it), so
+  // `base` tints the title, the spacer, and the button alike — the menu-bar
+  // strip still spans the dock, and the button's focus/hover styling still
+  // paints over it.
+  return row(
+    raw([
+      styledRow(segments as Parameters<typeof styledRow>[0], { style: base }),
+    ]),
+    flexSpacer(),
+    // Hide the dock, mirroring the file explorer's title-bar `×`: `bare`
+    // renders the glyph alone, and `hoverStyle` gives it the shared
+    // close-affordance highlight the tab and explorer `×` already wear.
+    //
+    // Mouse-only (`focusable: false`) for the same reason the explorer's is:
+    // the dock's Tab cycle belongs to the session list and its controls, and
+    // the keyboard already has "Orchestrator: Toggle Dock" and the View-menu
+    // entry to hide it.
+    button(DOCK_CLOSE_GLYPH, {
+      key: "dock-close",
+      focusable: false,
+      bare: true,
+      hoverStyle: { fg: "ui.tab_close_hover_fg" },
+    }),
+  );
 }
 
 // Option keys for the dock's project dropdown, in display order. Index 0
@@ -5404,6 +5515,7 @@ async function ensureReplacementWindow(projectRoot: string): Promise<boolean> {
     // close-and-switch below sees a second live window.
     orchestratorSessions.set(result.windowId, {
       id: result.windowId,
+      stableId: result.stableId || undefined,
       label,
       hostLabel: label,
       root: projectRoot,
@@ -6588,6 +6700,17 @@ const FRESH_CLI_SYSTEM_PROMPT = [
   "  // new workspace on its own git worktree, running an agent; resolves once it is up",
   "  const orch = editor.getPluginApi(\"orchestrator\");",
   "  return await orch.newWorkspace({ path: \"/repo\", agent: \"claude\", prompt: \"fix the flaky test\", newBranch: \"fix/flaky\" });",
+  "",
+  "  // teach a human the code you just wrote: author a tour, then open it in the dock",
+  "  // steps are {step_id, title, file_path, lines: [from, to] (1-indexed, inclusive), explanation (markdown)}",
+  "  editor.writeFile(\"/repo/.fresh-tour.json\", JSON.stringify({",
+  "    title: \"Request pipeline\", description: \"How a request reaches the handler\",",
+  "    schema_version: \"1.0\", steps: [",
+  "      { step_id: 1, title: \"Entry point\", file_path: \"src/main.rs\", lines: [1, 40],",
+  "        explanation: \"## Where it starts\\n\\nThe listener is built here.\\n\\n- binds the socket\\n- spawns the accept loop\" },",
+  "    ],",
+  "  }, null, 2));",
+  "  return await editor.getPluginApi(\"code-tour\").openTour(\".fresh-tour.json\");",
   "",
   "  // an agent in THIS workspace, and what workspaces exist",
   "  await orch.runAgent({ agent: \"claude\", prompt: \"...\" });",
@@ -9007,7 +9130,8 @@ async function runLocalCreate(id: number): Promise<void> {
     savePendingSpecs();
     orchestratorSessions.set(winId, {
       id: winId,
-      label: loadNames()[normRoot(root)] ?? sessionName,
+      stableId: result.stableId || undefined,
+      label: customNameFor(result.stableId || undefined, root) ?? sessionName,
       hostLabel: sessionName,
       root,
       projectPath: effectiveProjectPath,
@@ -9262,7 +9386,8 @@ async function attachToWorktree(opts: {
     }
     orchestratorSessions.set(id, {
       id,
-      label: loadNames()[normRoot(opts.root)] ?? opts.label,
+      stableId: result.stableId || undefined,
+      label: customNameFor(result.stableId || undefined, opts.root) ?? opts.label,
       hostLabel: opts.label,
       root: opts.root,
       projectPath: opts.projectPath,
@@ -10728,6 +10853,14 @@ editor.on("widget_event", (e) => {
       runDockMenuOption(e.widget_key.slice("menu-pick:".length));
       return;
     }
+    // Title-bar `[ × ]` → hide the dock, the same teardown Esc and
+    // "Orchestrator: Toggle Dock" run. Guarded on `dockMode` because the
+    // modal picker shares this handler and wears the host's own native
+    // close button instead.
+    if (e.event_type === "activate" && e.widget_key === "dock-close") {
+      if (dockMode) closeOpenDialog();
+      return;
+    }
     // Toggle the collapsible Filters section.
     if (e.event_type === "activate" && e.widget_key === "filters-toggle") {
       openDialog.filtersExpanded = !openDialog.filtersExpanded;
@@ -11181,3 +11314,22 @@ editor.registerCommand(
   null,
   { terminalBypass: true },
 );
+
+// View ▸ Orchestrator Dock — the menu route to the same toggle as the
+// command, the `toggle_dock_focus` accelerator, and the dock's own title-bar
+// `[ × ]`. It sits directly under "File Explorer" because the two are the
+// editor's two side panels and users look for them together.
+//
+// Both anchors are stable ids rather than rendered text: `"View"` is the
+// menu's `id` and `"toggle_file_explorer"` is the neighbouring row's action,
+// so the placement holds in every locale. The `dock` checkbox is a
+// host-computed menu-context key ("a dock panel is mounted"), which keeps
+// the checkmark honest even when the dock is closed by a route the plugin
+// didn't initiate.
+editor.addMenuItem({
+  menu: "View",
+  label: editor.t("menu.dock"),
+  action: "orchestrator_dock_toggle",
+  checkbox: "dock",
+  after: "toggle_file_explorer",
+});

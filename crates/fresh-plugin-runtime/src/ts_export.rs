@@ -19,13 +19,14 @@ use fresh_core::api::{
     BufferGroupResult, BufferInfo, BufferSavedDiff, CompositeHunk, CompositeLayoutConfig,
     CompositePaneStyle, CompositeSourceConfig, CreateCompositeBufferOptions, CreateTerminalOptions,
     CreateVirtualBufferInExistingSplitOptions, CreateVirtualBufferInSplitOptions,
-    CreateVirtualBufferOptions, CursorInfo, DirEntry, FormatterPackConfig, GrammarInfoSnapshot,
-    GrepMatch, JsDiagnostic, JsPosition, JsRange, JsTextPropertyEntry, KeyEventPayload,
-    LanguagePackConfig, LayoutHints, LspServerPackConfig, OverlayColorSpec, OverlayOptions,
-    PluginAnimationEdge, PluginAnimationKind, ProcessLimitsPackConfig, RemoteBackendInfo,
-    ReplaceResult, ScreenSize, ScrollbarMarker, SearchTakeResult, SpawnResult, SplitSnapshot,
-    TerminalResult, TextPropertiesAtCursor, TokenColor, TsHighlightSpan, ViewTokenStyle,
-    ViewTokenWire, ViewTokenWireKind, ViewportInfo, VirtualBufferResult, WindowInfo,
+    CreateVirtualBufferOptions, CursorInfo, DiffBaselineResult, DirEntry, FormatterPackConfig,
+    GrammarInfoSnapshot, GrepMatch, JsDiagnostic, JsPosition, JsRange, JsTextPropertyEntry,
+    KeyEventPayload, LanguagePackConfig, LayoutHints, LineDiffHunk, LspServerPackConfig,
+    OverlayColorSpec, OverlayOptions, PluginAnimationEdge, PluginAnimationKind,
+    ProcessLimitsPackConfig, RemoteBackendInfo, ReplaceResult, ScreenSize, ScrollbarMarker,
+    SearchTakeResult, SpawnResult, SplitSnapshot, TerminalResult, TextPropertiesAtCursor,
+    TokenColor, TsHighlightSpan, ViewTokenStyle, ViewTokenWire, ViewTokenWireKind, ViewportInfo,
+    VirtualBufferResult, WindowInfo,
 };
 use fresh_core::command::Suggestion;
 use fresh_core::file_explorer::{
@@ -66,6 +67,8 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         "WorkspaceDescription" => Some(fresh_core::api::WorkspaceDescription::decl(&cfg)),
         "ActionSpec" => Some(ActionSpec::decl(&cfg)),
         "BufferSavedDiff" => Some(BufferSavedDiff::decl(&cfg)),
+        "LineDiffHunk" => Some(LineDiffHunk::decl(&cfg)),
+        "DiffBaselineResult" => Some(DiffBaselineResult::decl(&cfg)),
         "LayoutHints" => Some(LayoutHints::decl(&cfg)),
 
         // Process types
@@ -114,6 +117,7 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         // UI types (ts-rs renames these with Ts prefix)
         "TsActionPopupAction" | "ActionPopupAction" => Some(ActionPopupAction::decl(&cfg)),
         "ActionPopupOptions" => Some(ActionPopupOptions::decl(&cfg)),
+        "AddMenuItemOptions" => Some(fresh_core::api::AddMenuItemOptions::decl(&cfg)),
         "TsLspMenuItem" | "LspMenuItem" => Some(fresh_core::api::LspMenuItem::decl(&cfg)),
         "TsHighlightSpan" => Some(TsHighlightSpan::decl(&cfg)),
         "FileExplorerDecoration" => Some(FileExplorerDecoration::decl(&cfg)),
@@ -363,6 +367,7 @@ const DEPENDENCY_TYPES: &[&str] = &[
     "ActionSpec",                      // Used by executeActions
     "TsActionPopupAction",             // Used by ActionPopupOptions.actions
     "ActionPopupOptions",              // Used by showActionPopup
+    "AddMenuItemOptions",              // Used by addMenuItem
     "TsLspMenuItem",                   // Used by setLspMenuContributions
     "FileExplorerDecoration",          // Used by setFileExplorerDecorations
     "FileExplorerSlotEntry",           // Used by setFileExplorerSlots
@@ -578,6 +583,15 @@ interface HookEventMap {
   after_file_open: { path: string; buffer_id: number };
   before_file_save: { path: string; buffer_id: number };
   after_file_save: { path: string; buffer_id: number };
+  /**
+   * Fired after a buffer is reloaded from disk: auto-revert picked up an
+   * external change (e.g. `git checkout <ref> -- <file>` in another
+   * terminal), or the user ran an explicit revert. Reloads don't fire
+   * `after_file_save`, so plugins that surface disk-derived state
+   * (git gutter, etc.) should subscribe to this too or their decorations
+   * go stale on every external reset.
+   */
+  after_file_revert: { path: string; buffer_id: number };
   /**
    * Fired by the file explorer after a paste/duplicate/etc. mutates
    * the filesystem without going through a buffer save. Plugins that
@@ -922,6 +936,8 @@ mod tests {
             "SplitSnapshot",
             "ActionSpec",
             "BufferSavedDiff",
+            "LineDiffHunk",
+            "DiffBaselineResult",
             "LayoutHints",
             "SpawnResult",
             "BackgroundProcessResult",
@@ -1356,6 +1372,13 @@ mod tests {
             "pathExtname",
             "pathIsAbsolute",
             "utf8ByteLength",
+            "computeLineDiff",
+            "registerDiffBaseline",
+            "diffAgainstBaseline",
+            "diffBaselinePair",
+            "getBaselineLines",
+            "refreshDiffBaseline",
+            "releaseDiffBaseline",
             "fileExists",
             "readFile",
             "writeFile",

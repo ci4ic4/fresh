@@ -3673,3 +3673,318 @@ fn settings_modal_covers_the_full_screen_and_dims_the_dock() {
         "the dock must dim while the settings modal is up"
     );
 }
+
+/// The dock's title bar carries a `[ × ]` hide button at its right edge —
+/// the affordance the file explorer beside it has always had — and clicking
+/// it tears the dock down.
+///
+/// Before this, the only way to put the dock away was the "Orchestrator:
+/// Toggle Dock" command or its accelerator, so the panel read as permanent
+/// furniture to anyone who reaches for a close button first.
+///
+/// The button is right-*aligned*, not padded to a guessed width: the title
+/// row is a Row with a flex spacer the host sizes against the dock's real
+/// column count. The assertion below therefore checks the glyph sits on the
+/// dock's last content column, which is what the previous "pad past the
+/// screen width and let the host clip the tail" title row could never
+/// express — the clipped tail was exactly where the button belongs.
+///
+/// It renders as the bare glyph (`bare: true`), not a framed `[ × ]`, and
+/// lights up under the pointer the way the tab and file explorer `×` do.
+#[test]
+fn dock_title_bar_close_button_hides_the_dock() {
+    let (_tmp, root) = setup_project("alphaproj");
+    let mut h =
+        EditorTestHarness::with_config_and_working_dir(120, 32, Default::default(), root.clone())
+            .unwrap();
+    h.render().unwrap();
+    open_dock(&mut h);
+
+    // The glyph shares the dock's title row, and wears no `[ ]` frame.
+    let title_row = row_of(&h, "Orchestrator") as u16;
+    let title_text = h.screen_row_text(title_row);
+    assert!(
+        title_text.contains('×'),
+        "dock title bar should carry a × hide button:\n{}",
+        h.screen_to_string()
+    );
+    assert!(
+        !title_text.contains("[ × ]") && !title_text.contains("[×]"),
+        "the × is a bare icon affordance, not a framed button:\n{}",
+        h.screen_to_string()
+    );
+    let close_col = title_text
+        .chars()
+        .position(|c| c == '×')
+        .expect("× just asserted present") as u16;
+
+    // It sits on the dock's last content column. The header rule under the
+    // toolbar is drawn by the host (`divider()`) across the panel's real
+    // inner width, so its final `─` *is* that column — comparing against it
+    // asserts the right-alignment without the test re-deriving the dock's
+    // geometry (width fraction, border, gutter) and without pinning the dock
+    // to any particular width.
+    let rule_row = h
+        .screen_to_string()
+        .lines()
+        .position(|l| l.starts_with("────"))
+        .expect("dock header rule should be on screen") as u16;
+    let cols = h.screen_row_text(rule_row).chars().count() as u16;
+    let content_last_col = (0..cols)
+        .take_while(|&c| h.get_cell(c, rule_row).as_deref() == Some("─"))
+        .last()
+        .expect("dock header rule should span the panel's inner width");
+    assert_eq!(
+        close_col,
+        content_last_col,
+        "the × must sit on the dock's last content column (glyph at \
+         {close_col}, content ends at {content_last_col}):\n{}",
+        h.screen_to_string()
+    );
+
+    // Pointing at it recolours it, so it reads as live before you commit to
+    // the click — the affordance the tab and explorer `×` already have.
+    let idle_fg = h.get_cell_style(close_col, title_row).unwrap().fg;
+    h.mouse_move(close_col, title_row).unwrap();
+    h.wait_until(|h| h.get_cell_style(close_col, title_row).unwrap().fg != idle_fg)
+        .unwrap();
+
+    // ...and moving off it puts the idle colour back, so the highlight
+    // tracks the pointer rather than latching on first contact.
+    h.mouse_move(0, title_row).unwrap();
+    h.wait_until(|h| h.get_cell_style(close_col, title_row).unwrap().fg == idle_fg)
+        .unwrap();
+
+    // Clicking it runs the same teardown as Esc / the toggle command: the
+    // whole dock column goes away, not just the title row.
+    h.mouse_click(close_col, title_row).unwrap();
+    h.wait_until(|h| !h.screen_to_string().contains("New Task"))
+        .unwrap();
+    h.assert_screen_not_contains("Filters");
+    h.assert_screen_not_contains("Search Tasks");
+}
+
+/// View ▸ Orchestrator Dock toggles the dock, sits directly under the file
+/// explorer's own toggle, and carries a checkbox that tracks whether the dock
+/// is actually up.
+///
+/// The row is contributed by the plugin (`editor.addMenuItem`), anchored by
+/// stable ids — the menu's `id` ("View") and the neighbouring row's action
+/// ("toggle_file_explorer") — rather than by translated labels, and its
+/// checkmark reads the host-computed `dock` menu-context key. Driving it from
+/// the menu bar exercises all three: the row exists, it landed in the right
+/// place, and the mark follows the panel.
+#[test]
+fn view_menu_row_toggles_the_dock_with_a_live_checkbox() {
+    let (_tmp, root) = setup_project("alphaproj");
+    let mut h =
+        EditorTestHarness::with_config_and_working_dir(120, 32, Default::default(), root.clone())
+            .unwrap();
+    h.render().unwrap();
+
+    // With the dock down, the row reads unchecked — and sits on the row
+    // immediately below the file explorer's toggle. (Both labels are matched
+    // together with their checkbox glyph so the *menu* rows are found, not
+    // the file explorer panel's own "File Explorer" title bar.)
+    h.send_key(KeyCode::Char('v'), KeyModifiers::ALT).unwrap();
+    h.render().unwrap();
+    h.assert_screen_contains("☐ Orchestrator Dock");
+    let explorer_row = row_of(&h, "File Explorer");
+    assert_eq!(
+        row_of(&h, "Orchestrator Dock"),
+        explorer_row + 1,
+        "the dock row belongs directly under the file explorer toggle:\n{}",
+        h.screen_to_string()
+    );
+
+    // Down lands on it (it was inserted at index 1, ahead of the separator);
+    // Enter dispatches the plugin action behind it and the dock comes up.
+    h.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("New Task"))
+        .unwrap();
+
+    // Re-opening the menu now shows the box ticked, because the checkbox
+    // reads the live "a dock panel is mounted" context key rather than
+    // anything the plugin remembers.
+    h.send_key(KeyCode::Char('v'), KeyModifiers::ALT).unwrap();
+    h.render().unwrap();
+    h.assert_screen_contains("☑ Orchestrator Dock");
+
+    // ...and the same row puts it away again.
+    h.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
+    h.wait_until(|h| !h.screen_to_string().contains("New Task"))
+        .unwrap();
+}
+
+// ── workspace rename stays per-workspace across co-tenants ─────────────────
+
+/// Renaming a workspace extracted from a tab ("Extract Tab to New
+/// Workspace") must rename ONLY that workspace. The extracted co-tenant
+/// shares the source's project root, and manual names used to be persisted
+/// per root — so renaming the new workspace silently renamed the original
+/// too (and vice versa). Names are now keyed by the window's durable
+/// stable id; the root key survives only as a legacy / windowless
+/// fallback.
+#[test]
+fn renaming_extracted_co_tenant_workspace_leaves_original_name_alone() {
+    let (_tmp, root) = setup_project("alphaproj");
+    let mut h =
+        EditorTestHarness::with_config_and_working_dir(160, 45, Default::default(), root.clone())
+            .unwrap();
+    h.render().unwrap();
+
+    // A file-backed tab is required for extraction.
+    h.open_file(&root.join("readme.txt")).unwrap();
+    h.render().unwrap();
+
+    // Extract the tab into a co-tenant workspace over the same root.
+    run_palette_command(&mut h, "Extract Tab to New Workspace");
+    h.wait_until(|h| {
+        h.screen_to_string()
+            .contains("Extracted readme.txt into workspace alphaproj (2)")
+    })
+    .unwrap();
+
+    // The dock lists both co-tenants.
+    open_dock(&mut h);
+    h.wait_until(|h| h.screen_to_string().contains("alphaproj (2)"))
+        .unwrap();
+
+    // Right-click the extracted workspace's row → "Rename…" → the centered
+    // Rename Workspace dialog, pre-filled with "alphaproj (2)".
+    let row = row_of(&h, "alphaproj (2)") as u16;
+    h.mouse_right_click(4, row).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("Rename…"))
+        .unwrap();
+    let (rcol, rrow) = pos_of(&h, "Rename…");
+    h.mouse_click(rcol, rrow).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("Rename Workspace"))
+        .unwrap();
+    h.assert_screen_contains("Workspace name");
+
+    // Replace the pre-filled name wholesale with a distinct one.
+    for _ in 0.."alphaproj (2)".len() {
+        h.send_key(KeyCode::Backspace, KeyModifiers::NONE).unwrap();
+    }
+    h.type_text("extracted-ws").unwrap();
+    h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
+    h.wait_until(|h| {
+        let s = h.screen_to_string();
+        !s.contains("Rename Workspace") && s.contains("extracted-ws")
+    })
+    .unwrap();
+
+    // Only the extracted workspace carries the new name...
+    let screen = h.screen_to_string();
+    let renamed_rows = screen
+        .lines()
+        .filter(|l| l.contains("extracted-ws"))
+        .count();
+    assert_eq!(
+        renamed_rows, 1,
+        "exactly one dock row should carry the new name (renaming the \
+         extracted co-tenant must not rename the original), got screen:\n{screen}"
+    );
+    // ...and the original workspace still shows its own label on a row of
+    // its own (a row naming it WITHOUT the new name).
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.contains("alphaproj") && !l.contains("extracted-ws")),
+        "the original workspace should keep its 'alphaproj' label, got screen:\n{screen}"
+    );
+}
+
+/// Filing a workspace extracted from a tab ("Extract Tab to New
+/// Workspace") into a folder must move ONLY that workspace. Folder
+/// assignments used to be keyed per root — and the extracted co-tenant
+/// shares the original's project root, so moving either filed both. Like
+/// manual names, assignments are now keyed by the window's durable
+/// stable id, the root key surviving only as a legacy / windowless
+/// fallback.
+#[test]
+fn moving_extracted_co_tenant_workspace_to_folder_leaves_original_unfiled() {
+    let (_tmp, root) = setup_project("alphaproj");
+    let mut h =
+        EditorTestHarness::with_config_and_working_dir(160, 45, Default::default(), root.clone())
+            .unwrap();
+    h.render().unwrap();
+
+    // Extract a file tab into a co-tenant workspace over the same root.
+    h.open_file(&root.join("readme.txt")).unwrap();
+    h.render().unwrap();
+    run_palette_command(&mut h, "Extract Tab to New Workspace");
+    h.wait_until(|h| {
+        h.screen_to_string()
+            .contains("Extracted readme.txt into workspace alphaproj (2)")
+    })
+    .unwrap();
+
+    open_dock(&mut h);
+    h.wait_until(|h| h.screen_to_string().contains("alphaproj (2)"))
+        .unwrap();
+
+    // Create an empty folder "Docs" (organize checkbox off).
+    let new_row = row_of(&h, "New Task") as u16;
+    h.mouse_click(4, new_row).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("New Folder"))
+        .unwrap();
+    h.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("Folder name"))
+        .unwrap();
+    h.type_text("Docs").unwrap();
+    h.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    h.send_key(KeyCode::Char(' '), KeyModifiers::NONE).unwrap();
+    h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
+    h.wait_until(|h| {
+        let s = h.screen_to_string();
+        !s.contains("Folder name") && s.contains("Docs")
+    })
+    .unwrap();
+
+    // Right-click the EXTRACTED workspace's row → "Move to Folder…" →
+    // pick "Docs" (cursor starts on "Top level"; ↓ lands on the folder).
+    let session_row = row_of(&h, "alphaproj (2)") as u16;
+    h.mouse_right_click(4, session_row).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("Move to Folder"))
+        .unwrap();
+    let (mcol, mrow) = pos_of(&h, "Move to Folder");
+    h.mouse_click(mcol, mrow).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("Top level"))
+        .unwrap();
+    h.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
+
+    // The move landed once the folder header reports a member count at
+    // all (an empty folder shows none). Waiting on the bare "(" keeps
+    // this settle-wait bug-agnostic, so the count assertion below fails
+    // fast instead of hanging a broken build in `wait_until`.
+    h.wait_until(|h| {
+        h.screen_to_string()
+            .lines()
+            .any(|l| l.contains("Docs") && l.contains("("))
+    })
+    .unwrap();
+    // Exactly ONE member — the extracted workspace. Per-root assignment
+    // used to file the original co-tenant too, reading "Docs (2)".
+    let screen = h.screen_to_string();
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.contains("Docs") && l.contains("(1)")),
+        "the folder should hold only the extracted workspace (the original \
+         co-tenant must not be filed with it), got screen:\n{screen}"
+    );
+    // The original workspace still renders on a row of its own, outside
+    // the folder (its title row names it without the co-tenant counter).
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.contains("alphaproj") && !l.contains("(2)") && !l.contains("Docs")),
+        "the original workspace should still render as its own top-level row, \
+         got screen:\n{screen}"
+    );
+}

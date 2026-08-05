@@ -303,9 +303,27 @@ export function button(
      * advances one stop per group (the active option) and ←/→ moves
      * the selection within the group. Defaults to true. */
     focusable?: boolean;
+    /** Render the label alone — no `[ ]` frame, no focus-marker
+     * gutter — turning the button into an *icon affordance* (a `×`
+     * close glyph, a `▾` chevron) rather than a framed action. Use
+     * where the glyph itself is the control; keep the default for
+     * anything with a word on it. Layout only — `hoverStyle` decides
+     * how it looks under the pointer. */
+    bare?: boolean;
+    /** How the button looks while the pointer is over it. Omit to
+     * leave it looking the same hovered as not.
+     *
+     * The host applies this as the mouse moves, with no round-trip to
+     * the plugin, so hover costs a panel re-render and nothing more.
+     * It outranks focus styling while both apply.
+     *
+     * For a close glyph, `{ fg: "ui.tab_close_hover_fg" }` is the
+     * editor's shared "close affordance under the pointer" look — the
+     * tab `×` and the file explorer's `×` both use it. */
+    hoverStyle?: Partial<OverlayOptions>;
   },
 ): WidgetSpec {
-  return {
+  const spec: WidgetSpec = {
     kind: "button",
     label,
     focused: options?.focused ?? false,
@@ -313,7 +331,13 @@ export function button(
     key: options?.key,
     disabled: options?.disabled ?? false,
     focusable: options?.focusable ?? true,
+    bare: options?.bare ?? false,
   };
+  // Omit rather than pass `undefined`: the plugin bridge turns a
+  // present `undefined` into JSON `null`, which fails to deserialize
+  // as the host's `Option<OverlayOptions>`.
+  if (options?.hoverStyle !== undefined) spec.hoverStyle = options.hoverStyle;
+  return spec;
 }
 
 /** Horizontal spacer of fixed column count. In a `Row` it produces
@@ -571,6 +595,15 @@ export function text(
      * from the value with `: `, so a column of controls aligns their
      * value cells. `0` (default) keeps the compact `label [value]`. */
     labelWidth?: number;
+    /** Reject every mutating operation (typing, Backspace/Delete, Cut,
+     * Paste) while keeping caret motion, selection, and Copy. Implied
+     * by `markdown`. */
+    readOnly?: boolean;
+    /** Render `value` as a markdown document (multi-line only): the
+     * host renders it through the same engine as LSP hover docs and
+     * word-wraps to the widget's width. Forcibly read-only; the caret,
+     * selection, and Copy operate on the rendered plain text. */
+    markdown?: boolean;
     key?: string;
   } = {},
 ): WidgetSpec {
@@ -590,6 +623,8 @@ export function text(
     selStart: options.selStart ?? -1,
     selEnd: options.selEnd ?? -1,
     labelWidth: options.labelWidth ?? 0,
+    readOnly: options.readOnly ?? false,
+    markdown: options.markdown ?? false,
     key: options.key,
   };
 }

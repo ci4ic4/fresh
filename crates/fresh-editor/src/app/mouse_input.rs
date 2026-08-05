@@ -23,6 +23,18 @@ fn in_rect(col: u16, row: u16, rect: Rect) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
 
+/// Where a screen cell lands inside a floating widget panel. See
+/// [`Editor::probe_floating_widget`].
+struct FloatingWidgetProbe {
+    /// 0-indexed row within the panel's rendered entries.
+    brow: u32,
+    /// UTF-8 byte offset within that row's text (the overlay's text when
+    /// an overlay covers the row).
+    bcol: usize,
+    /// The widget under the cell, or `None` for a cell on no widget.
+    hit: Option<crate::widgets::HitArea>,
+}
+
 impl Editor {
     /// If any overlay layer captures mouse events, dispatch to its
     /// dedicated handler and return its result; otherwise return `None`
@@ -128,7 +140,15 @@ impl Editor {
             MouseEventKind::ScrollDown => {
                 self.handle_floating_widget_panel_wheel(super::PanelSlot::Floating, col, row, 3);
             }
-            // Right-click, horizontal scroll, motion, other-button releases:
+            // The modal owns the whole mouse channel, so it has to drive
+            // hover for its own panel — the normal pipeline's tracker is
+            // unreachable from here. Scoped to `Floating`: the dock may
+            // still be mounted underneath, and a pointer over the modal is
+            // not over the dock widget it happens to cover.
+            MouseEventKind::Moved => {
+                self.update_widget_hover(col, row, Some(super::PanelSlot::Floating));
+            }
+            // Right-click, horizontal scroll, other-button releases:
             // swallowed — the modal eats them all.
             _ => {}
         }
@@ -326,6 +346,7 @@ impl Editor {
 
                 // Stop dragging and clear drag state
                 self.release_widget_scrollbar();
+                self.widget_text_drag = None;
                 self.clear_active_window_drag_state();
 
                 // If we finished dragging a split separator, the split
@@ -412,6 +433,13 @@ impl Editor {
                         needs_render = true;
                     }
                 }
+
+                // Bare icon buttons inside a panel (the dock's `×`) light up
+                // under the pointer, the way the tab and file explorer `×`
+                // do. Tracked off the same motion events as the scrollbar
+                // reveal above, and likewise re-rendering only on the
+                // enter/leave transition.
+                needs_render = self.update_widget_hover(col, row, None) || needs_render;
             }
             MouseEventKind::ScrollUp => {
                 self.handle_vertical_scroll(col, row, mouse_event.modifiers, -3)?;
@@ -536,12 +564,7 @@ impl Editor {
         {
             // The dock swallows the wheel whenever the pointer is over
             // its column (never leaks to the window beneath).
-        } else if self
-            .active_window()
-            .split_at_position(col, row)
-            .map(|(_, buffer_id)| self.handle_widget_panel_wheel(buffer_id, delta))
-            .unwrap_or(false)
-        {
+        } else if self.handle_split_widget_panel_wheel(col, row, delta) {
             // a mounted widget panel consumed the scroll
         } else {
             if self.active_window().focused_terminal_live() {
@@ -2779,6 +2802,13 @@ impl Editor {
             }
             return Ok(());
         }
+        // Drag-to-select on a widget markdown/text document: armed by the
+        // press that placed the caret; every Drag extends the selection to
+        // the pointer.
+        if self.widget_text_drag.is_some() {
+            self.handle_widget_text_selection_drag(col, row);
+            return Ok(());
+        }
         // Floating-panel list scrollbar drag takes precedence — the
         // modal panel owns the input channel while it's up.
         if self.try_widget_scrollbar_drag(super::PanelSlot::Dock, row)
@@ -3961,7 +3991,12 @@ impl Editor {
         if row < inner.y || row >= inner.y + inner.height {
             return false;
         }
-        let scrolled = self.handle_widget_panel_wheel(slot.buffer_id(), delta);
+        // Panel-relative pointer position, so the wheel scrolls the
+        // List/Tree under it rather than the first one in the spec.
+        // Floating panels paint their entries from row 0 at `inner`,
+        // so the translation is a plain offset.
+        let pos = (u32::from(row - inner.y), u32::from(col - inner.x));
+        let scrolled = self.handle_widget_panel_wheel_at(slot.buffer_id(), Some(pos), delta);
         // The non-modal dock must swallow the wheel whenever the pointer
         // is over it, even when the list is too short to scroll — the
         // scroll must never leak through to the active window beneath.
@@ -3970,6 +4005,128 @@ impl Editor {
             Some(super::PanelPlacement::LeftDock { .. })
         );
         scrolled || is_dock
+    }
+
+    /// Route a vertical wheel to a widget panel mounted into an editor
+    /// split (Settings, Search & Replace, the code-tour dock). Resolves
+    /// the split under the pointer, translates the screen position into
+    /// the panel's (buffer row, display column), and hands it to
+    /// [`handle_widget_panel_wheel_at`](Self::handle_widget_panel_wheel_at)
+    /// so the wheel scrolls the list the pointer is actually over —
+    /// not the first list in the spec. Returns `true` when a panel
+    /// consumed the scroll.
+    fn handle_split_widget_panel_wheel(&mut self, col: u16, row: u16, delta: i32) -> bool {
+        let Some((split_id, buffer_id)) = self.active_window().split_at_position(col, row) else {
+            return false;
+        };
+        if self.widget_registry.panels_for_buffer(buffer_id).is_empty() {
+            return false;
+        }
+        let content_rect = self
+            .active_layout()
+            .split_areas
+            .iter()
+            .find(|(sid, ..)| *sid == split_id)
+            .map(|(_, _, rect, ..)| *rect);
+        let pos = content_rect.and_then(|rect| {
+            if !in_rect(col, row, rect) {
+                return None;
+            }
+            // Buffer row = viewport top line + rows below the content
+            // origin. Panels render one entry per line (no soft wrap)
+            // and are normally pinned to the top, but honour a scrolled
+            // viewport all the same.
+            let top_byte = self
+                .windows
+                .get(&self.active_window)
+                .and_then(|w| w.buffers.splits())
+                .map(|(_, vs)| vs)
+                .and_then(|vs| vs.get(&split_id))
+                .map(|vs| vs.viewport.top_byte())
+                .unwrap_or(0);
+            let top_line = self
+                .buffers()
+                .get(&buffer_id)
+                .map(|s| s.buffer.get_line_number(top_byte))
+                .unwrap_or(0);
+            let gutter = self
+                .buffers()
+                .get(&buffer_id)
+                .map(|s| s.margins.left_total_width() as u16)
+                .unwrap_or(0);
+            let panel_row = u32::from(row - rect.y).saturating_add(top_line as u32);
+            let panel_col = u32::from(col.saturating_sub(rect.x).saturating_sub(gutter));
+            Some((panel_row, panel_col))
+        });
+        self.handle_widget_panel_wheel_at(buffer_id, pos, delta)
+    }
+
+    /// Extend an armed widget-text drag selection to the pointer.
+    ///
+    /// Translates the screen position into the document's (rendered
+    /// line, byte-in-line) through the widget's recorded scroll region
+    /// — the same geometry wheel routing hit-tests — then hands the
+    /// caret move to the runtime. Rows above/below the region clamp to
+    /// its edges so a drag that overshoots keeps selecting.
+    fn handle_widget_text_selection_drag(&mut self, col: u16, row: u16) {
+        use crate::primitives::display_width::grapheme_byte_at_visual_column;
+        let Some(drag) = self.widget_text_drag.clone() else {
+            return;
+        };
+        let Some(panel) = self.widget_registry.get(&drag.panel) else {
+            return;
+        };
+        let buffer_id = panel.buffer_id;
+        let Some(region) = panel
+            .scroll_regions
+            .iter()
+            .find(|r| r.list_key == drag.widget)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(rect) = self
+            .active_layout()
+            .split_areas
+            .iter()
+            .find(|(_, bid, ..)| *bid == buffer_id)
+            .map(|(_, _, rect, ..)| *rect)
+        else {
+            return;
+        };
+        let (top_line, gutter) = self
+            .buffers()
+            .get(&buffer_id)
+            .map(|s| (0usize, s.margins.left_total_width() as u16))
+            .unwrap_or((0, 0));
+        // Buffer row under the pointer, clamped into the region's row
+        // band (dragging past either edge selects to the visible edge).
+        let brow = top_line + usize::from(row.max(rect.y) - rect.y);
+        let rel_row = brow
+            .saturating_sub(region.buffer_row as usize)
+            .min(region.height_rows.saturating_sub(1) as usize);
+        let line = (region.scroll + rel_row).min(region.total.saturating_sub(1));
+        // Byte within the rendered line, from the pointer's display
+        // column within the widget's region.
+        let widget_col = usize::from(col.saturating_sub(rect.x).saturating_sub(gutter))
+            .saturating_sub(region.col_in_row as usize);
+        let line_text = self
+            .widget_registry
+            .get(&drag.panel)
+            .and_then(|p| match p.instance_states.get(&drag.widget) {
+                Some(crate::widgets::WidgetInstanceState::Text { editor, .. }) => Some(
+                    editor
+                        .value()
+                        .split('\n')
+                        .nth(line)
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let byte_in_line = grapheme_byte_at_visual_column(&line_text, widget_col);
+        self.extend_widget_text_selection_to(&drag, line, byte_in_line);
     }
 
     /// Try to start a floating-panel list scrollbar drag. Returns
@@ -4233,6 +4390,127 @@ impl Editor {
         in_rect(col, row, popup_rect)
     }
 
+    /// Resolve a screen cell against a mounted floating panel: the
+    /// panel-local row and byte column it maps to, plus the widget hit
+    /// there (`None` when the cell is over no widget).
+    ///
+    /// Returns `None` when the panel isn't mounted, hasn't been drawn yet,
+    /// or the cell is outside its inner rect — i.e. "not this panel's cell"
+    /// as distinct from "this panel's cell, no widget on it".
+    ///
+    /// Shared by the click path and the hover tracker so the two can never
+    /// disagree about what the pointer is on. They did once for left- vs
+    /// right-click (byte-exact vs row-wide resolution), and compact dock
+    /// rows silently swallowed clicks past their label for it.
+    fn probe_floating_widget(
+        &self,
+        slot: super::PanelSlot,
+        col: u16,
+        row: u16,
+    ) -> Option<FloatingWidgetProbe> {
+        let inner = self.panel(slot)?.last_inner_rect?;
+        if col < inner.x || col >= inner.x + inner.width {
+            return None;
+        }
+        if row < inner.y || row >= inner.y + inner.height {
+            return None;
+        }
+        let brow = (row - inner.y) as u32;
+        let local_screen_col = (col - inner.x) as usize;
+        // A row an `Overlay` covers (the dock's "New Task… ▾" / "Move to
+        // Folder…" dropdowns float over the tree without reflowing it) is
+        // DRAWN from the overlay's text, so the column has to be mapped
+        // through that text — it is what the user is pointing at, and what
+        // the overlay's hit areas were measured against. Mapping through
+        // the row underneath yields a byte offset in a different string,
+        // which is why the dropdown options were unclickable: the offset
+        // never landed inside an option's range.
+        let panel = self.panel(slot)?;
+        let overlay_text = panel
+            .overlays
+            .iter()
+            .find(|o| o.buffer_row == brow)
+            .map(|o| o.entry.text.as_str());
+        let on_overlay = overlay_text.is_some();
+        let row_text =
+            overlay_text.or_else(|| panel.entries.get(brow as usize).map(|e| e.text.as_str()))?;
+        let bcol = crate::primitives::display_width::grapheme_byte_at_visual_column(
+            row_text,
+            local_screen_col,
+        );
+        // Row-aware resolution: an exact byte hit wins, but a click past a
+        // compact list/tree row's text still lands on the row (its body
+        // `select`) instead of being dropped — the same rule the
+        // right-click context path uses.
+        //
+        // Over an overlay that rule is off: the popup is opaque, so only its
+        // own hits are reachable and a click that misses every option (its
+        // border, its padding) is swallowed rather than falling through to
+        // the row it hides.
+        let hit = if on_overlay {
+            self.widget_registry
+                .overlay_hit_test(slot.buffer_id(), brow, bcol as u32)
+        } else {
+            self.widget_registry
+                .hit_test_row_aware(slot.buffer_id(), brow, bcol as u32)
+        };
+        Some(FloatingWidgetProbe {
+            brow,
+            bcol,
+            hit: hit.map(|(_, h)| h.clone()),
+        })
+    }
+
+    /// Track which widget the pointer is over, per mounted panel, and
+    /// re-render a panel whose hovered widget changed.
+    ///
+    /// Purely host state: the tracked key feeds `RenderContext::hover_key`,
+    /// which the renderer compares against each widget's own key. A hover
+    /// therefore costs a hit-test and — only when the pointer crosses a
+    /// widget boundary — one spec re-render. Nothing crosses the plugin
+    /// bridge, so panels pay nothing for pointer movement over them.
+    ///
+    /// The re-render is needed because the draw pass paints the panel's
+    /// cached entries; a highlight change has to go back through the
+    /// renderer to appear.
+    ///
+    /// `pointer_owner` names the slot the pointer is actually addressing,
+    /// for callers that already know: a centered modal captures the mouse
+    /// channel outright, and the dock it covers must not keep (or gain) a
+    /// highlight from a pointer that is really over the modal. `None` —
+    /// the normal, non-modal pipeline — leaves every mounted panel
+    /// reachable.
+    fn update_widget_hover(
+        &mut self,
+        col: u16,
+        row: u16,
+        pointer_owner: Option<super::PanelSlot>,
+    ) -> bool {
+        let mut changed = false;
+        for slot in [super::PanelSlot::Dock, super::PanelSlot::Floating] {
+            // A slot the pointer isn't addressing resolves to "nothing
+            // hovered", which also *clears* whatever it had highlighted.
+            let now = if pointer_owner.is_none_or(|owner| owner == slot) {
+                self.probe_floating_widget(slot, col, row)
+                    .and_then(|p| p.hit)
+                    .map(|h| h.widget_key)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let panel_key = match self.panel(slot) {
+                Some(fwp) if fwp.hovered_widget_key != now => fwp.panel_key.clone(),
+                _ => continue,
+            };
+            if let Some(fwp) = self.panel_mut(slot) {
+                fwp.hovered_widget_key = now;
+            }
+            self.rerender_widget_panel(&panel_key);
+            changed = true;
+        }
+        changed
+    }
+
     fn handle_floating_widget_click(&mut self, slot: super::PanelSlot, col: u16, row: u16) {
         // An open dropdown's option list floats as a screen-level pop-over
         // that extends PAST the panel/modal border, so a click on one of
@@ -4247,72 +4525,20 @@ impl Editor {
         if self.try_widget_scrollbar_press(slot, col, row) {
             return;
         }
-        let (panel_key, inner) = match self.panel(slot) {
-            Some(fwp) => match fwp.last_inner_rect {
-                Some(rect) => (fwp.panel_key.clone(), rect),
-                None => return,
-            },
+        let panel_key = match self.panel(slot) {
+            Some(fwp) => fwp.panel_key.clone(),
             None => return,
         };
-        if col < inner.x || col >= inner.x + inner.width {
-            return;
-        }
-        if row < inner.y || row >= inner.y + inner.height {
-            return;
-        }
-        let brow = (row - inner.y) as u32;
-        let entries = self
-            .panel(slot)
-            .map(|f| f.entries.clone())
-            .unwrap_or_default();
-        let local_screen_col = (col - inner.x) as usize;
-        // A row an `Overlay` covers (the dock's "New Task… ▾" / "Move to
-        // Folder…" dropdowns float over the tree without reflowing it) is
-        // DRAWN from the overlay's text, so the click column has to be
-        // mapped through that text — it is what the user is pointing at,
-        // and what the overlay's hit areas were measured against. Mapping
-        // through the row underneath yields a byte offset in a different
-        // string, which is why the dropdown options were unclickable: the
-        // offset never landed inside an option's range.
-        let overlay_text = self.panel(slot).and_then(|f| {
-            f.overlays
-                .iter()
-                .find(|o| o.buffer_row == brow)
-                .map(|o| o.entry.text.clone())
-        });
-        let on_overlay = overlay_text.is_some();
-        let row_text =
-            match overlay_text.or_else(|| entries.get(brow as usize).map(|e| e.text.clone())) {
-                Some(text) => text,
-                None => return,
-            };
-        let bcol = crate::primitives::display_width::grapheme_byte_at_visual_column(
-            &row_text,
-            local_screen_col,
-        );
-        // Row-aware resolution: an exact byte hit wins, but a click past a
-        // compact list/tree row's text still lands on the row (its body
-        // `select`) instead of being dropped — the same rule the
-        // right-click context path uses, kept in one place so the two can't
-        // drift (they did once: right-click was row-wide, left-click was
-        // byte-exact, so compact dock rows ignored left-clicks past the label).
-        //
-        // Over an overlay that rule is off: the popup is opaque, so only its
-        // own hits are reachable and a click that misses every option (its
-        // border, its padding) is swallowed rather than falling through to
-        // the row it hides.
-        let resolved = if on_overlay {
-            self.widget_registry
-                .overlay_hit_test(slot.buffer_id(), brow, bcol as u32)
-        } else {
-            self.widget_registry
-                .hit_test_row_aware(slot.buffer_id(), brow, bcol as u32)
+        let probe = match self.probe_floating_widget(slot, col, row) {
+            Some(p) => p,
+            None => return,
         };
-        let (mut hit_payload, hit_event, hit_key, hit_kind, hit_byte_start) = match resolved {
-            Some((_, hit)) => (
-                hit.payload.clone(),
+        let (brow, bcol) = (probe.brow, probe.bcol);
+        let (mut hit_payload, hit_event, hit_key, hit_kind, hit_byte_start) = match probe.hit {
+            Some(hit) => (
+                hit.payload,
                 hit.event_type.to_string(),
-                hit.widget_key.clone(),
+                hit.widget_key,
                 hit.widget_kind,
                 hit.byte_start,
             ),

@@ -1575,6 +1575,9 @@ fn render_control(
                     label_width.unwrap_or(0) as u32,
                     true,
                     state.scroll_offset as u32,
+                    // The settings dialog draws its own selection chrome
+                    // and never reserved the `▸ ` focus-marker gutter.
+                    false,
                 );
                 scroll_offset = rendered.scroll_offset;
                 for (row_i, (_idx, entry)) in rendered.option_rows.iter().enumerate() {
@@ -2475,6 +2478,8 @@ fn render_search_header(frame: &mut Frame, area: Rect, state: &SettingsState, th
         sel_start,
         sel_end,
         label_width: 0,
+        read_only: false,
+        markdown: false,
         key: None,
     };
     let out = crate::widgets::render_spec_no_autofocus(

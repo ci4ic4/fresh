@@ -17,6 +17,7 @@ pub mod buffer_lifecycle;
 pub mod buffer_settings_commands;
 pub mod capslock_shortcuts;
 pub mod cargo_config_editing;
+pub mod code_tour_dock;
 pub mod command_palette;
 pub mod config_language_selector;
 pub mod copy_buffer_path;
@@ -97,6 +98,7 @@ pub mod issue_2796_key_release_duplicates;
 #[cfg(feature = "plugins")]
 pub mod issue_2810_session_escape_flush;
 pub mod issue_2843_single_line_viewport;
+pub mod issue_2893_replace_all_many_matches;
 pub mod issue_779_after_eof_shade;
 pub mod issue_close_file_in_split_hides_buffer_group;
 pub mod language_dialog_esc_cancels_edit;
@@ -295,8 +297,10 @@ pub mod unicode_cursor;
 pub mod unicode_prompt_bugs;
 pub mod universal_lsp;
 pub mod unnamed_buffer_persistence;
+pub mod unsaved_change_gutter;
 pub mod update_notification;
 pub mod vertical_rulers;
+pub mod vertical_scrollbar_cursor_extent;
 #[cfg(feature = "plugins")]
 pub mod vi_mode;
 #[cfg(feature = "plugins")]

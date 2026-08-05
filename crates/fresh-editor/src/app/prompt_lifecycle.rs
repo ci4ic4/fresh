@@ -94,6 +94,17 @@ impl Editor {
         // Dismiss transient popups and clear hover state when opening a prompt
         self.active_window_mut().on_editor_focus_lost();
 
+        // A new prompt displacing a live `editor.pickFile` browser must
+        // resolve the pick as cancelled — a dangling callback would
+        // otherwise hijack the next Open File confirm. (`pickFile`
+        // itself arms the callback after this runs.)
+        if let Some(stale) = self.active_window_mut().pending_file_pick_callback.take() {
+            self.plugin_manager
+                .read()
+                .unwrap()
+                .resolve_callback(stale, "null".to_string());
+        }
+
         // Clear search highlights when starting a new search prompt
         // This ensures old highlights from previous searches don't persist
         match prompt_type {
@@ -439,28 +450,44 @@ impl Editor {
     /// (from current buffer's directory or working directory) and triggers async
     /// directory loading.
     pub(super) fn init_file_open_state(&mut self) {
-        // Determine initial directory
-        let buffer_id = self.active_buffer();
+        self.init_file_open_state_at(None, None);
+    }
 
-        // For terminal buffers, use the terminal's initial CWD or fall back to project root
-        // This avoids showing the terminal backing file directory which is confusing for users
-        let initial_dir = if self.active_window().is_terminal_buffer(buffer_id) {
-            self.active_window()
-                .get_terminal_id(buffer_id)
-                .and_then(|tid| self.active_window().terminal_manager.get(tid))
-                .and_then(|handle| handle.cwd())
-                .unwrap_or_else(|| self.working_dir().to_path_buf())
-        } else {
-            self.active_state()
-                .buffer
-                .file_path()
-                .and_then(|path| path.parent())
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| self.working_dir().to_path_buf())
-        };
+    /// Initialize the file open dialog state, optionally pinning the
+    /// starting directory and hidden-file visibility. `pickFile` callers
+    /// use the overrides when the default anchor (the active file's
+    /// directory) or the config's dotfile filter would hide the very
+    /// files being picked; `None` keeps the Ctrl+O behavior.
+    pub(super) fn init_file_open_state_at(
+        &mut self,
+        dir_override: Option<PathBuf>,
+        show_hidden_override: Option<bool>,
+    ) {
+        let initial_dir = dir_override.unwrap_or_else(|| {
+            let buffer_id = self.active_buffer();
+
+            // For terminal buffers, use the terminal's initial CWD or fall back to
+            // project root. This avoids showing the terminal backing file directory
+            // which is confusing for users.
+            if self.active_window().is_terminal_buffer(buffer_id) {
+                self.active_window()
+                    .get_terminal_id(buffer_id)
+                    .and_then(|tid| self.active_window().terminal_manager.get(tid))
+                    .and_then(|handle| handle.cwd())
+                    .unwrap_or_else(|| self.working_dir().to_path_buf())
+            } else {
+                self.active_state()
+                    .buffer
+                    .file_path()
+                    .and_then(|path| path.parent())
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| self.working_dir().to_path_buf())
+            }
+        });
 
         // Create the file open state with config-based show_hidden setting
-        let show_hidden = self.config.file_browser.show_hidden;
+        // unless the caller pinned it.
+        let show_hidden = show_hidden_override.unwrap_or(self.config.file_browser.show_hidden);
         self.active_window_mut().file_open_state = Some(file_open::FileOpenState::new(
             initial_dir.clone(),
             show_hidden,
@@ -851,6 +878,18 @@ impl Editor {
                     // Clear file browser state
                     self.active_window_mut().file_open_state = None;
                     self.active_window_mut().file_browser_layout = None;
+
+                    // A cancelled `editor.pickFile` browser resolves the
+                    // plugin's promise with null, like a dismissed file
+                    // dialog resolves an empty pick in a browser.
+                    if let Some(callback_id) =
+                        self.active_window_mut().pending_file_pick_callback.take()
+                    {
+                        self.plugin_manager
+                            .read()
+                            .unwrap()
+                            .resolve_callback(callback_id, "null".to_string());
+                    }
 
                     // Cancelling a Save-As that was opened as part of the
                     // "save and quit" chain aborts the quit — the user

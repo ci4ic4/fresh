@@ -818,6 +818,44 @@ type ActionPopupOptions = {
 	*/
 	buffer_id?: number;
 };
+type AddMenuItemOptions = {
+	/**
+	* Target menu, matched against each menu's stable `id` ("View",
+	* "File", …) first and its display label second. A menu that matches
+	* neither is left alone and the call is a no-op.
+	*/
+	menu: string;
+	/**
+	* Row label, already localised by the plugin (`editor.t(…)`).
+	*/
+	label: string;
+	/**
+	* Action dispatched when the row is chosen. A name the editor doesn't
+	* know is routed to the plugin action of the same name — i.e. the
+	* handler registered with `registerHandler`.
+	*/
+	action: string;
+	/**
+	* Menu-context key whose boolean value renders the row's checkmark
+	* (e.g. `"dock"`). Omit for a plain action row.
+	*/
+	checkbox?: string;
+	/**
+	* Menu-context key gating whether the row is enabled. Omit for a row
+	* that is always available.
+	*/
+	when?: string;
+	/**
+	* Insert directly after the existing row whose action or label this
+	* names. Ignored when nothing matches (the row is appended instead).
+	*/
+	after?: string;
+	/**
+	* Insert directly before the existing row whose action or label this
+	* names. Ignored when `after` is set, or when nothing matches.
+	*/
+	before?: string;
+};
 type TsLspMenuItem = {
 	/**
 	* Stable identifier used as the `action_id` in the resulting
@@ -1560,6 +1598,41 @@ type WidgetSpec = {
 	* are tabbable).
 	*/
 	focusable: boolean;
+	/**
+	* Render the label alone — no `[ ]` frame, no focus-marker
+	* gutter — turning the button into a bare *icon affordance*
+	* (a `×` close glyph, a `▾` chevron) rather than a framed
+	* action. Use it where the glyph itself is the control and a
+	* frame would read as clutter; keep the default `false` for
+	* anything with a word on it.
+	*
+	* This controls layout only; `hover_style` controls how the
+	* button looks under the pointer.
+	*/
+	bare: boolean;
+	/**
+	* Style applied while the pointer is over this button. `None`
+	* (the default) leaves it looking the same hovered as not.
+	*
+	* Hover is host state — it changes with mouse motion and no
+	* plugin round-trip — so the plugin declares the *appearance*
+	* once in the spec and the host applies it as the pointer
+	* moves. Nothing crosses the plugin bridge on a hover.
+	*
+	* It outranks focus styling while both apply: the pointer is
+	* the more immediate signal, and the one the user is actively
+	* driving.
+	*
+	* For a close glyph, `ui.tab_close_hover_fg` is the editor's
+	* shared "close affordance under the pointer" key — the tab
+	* `×` and the file explorer's `×` both read it, so a plugin
+	* naming it gets the same highlight users already know.
+	*
+	* `Button` is the first kind to carry this; other widget kinds
+	* adopt it with the same field plus a `ctx.is_hovered(key)`
+	* check in their renderer.
+	*/
+	hoverStyle?: Partial<OverlayOptions>;
 } | {
 	"kind": "spacer";
 	cols: number;
@@ -1781,6 +1854,23 @@ type WidgetSpec = {
 	* narrow surfaces.
 	*/
 	labelWidth: number;
+	/**
+	* Reject every mutating operation (typing, Backspace/Delete,
+	* Cut, Paste) while keeping caret motion, selection, and Copy.
+	* Implied by `markdown`.
+	*/
+	readOnly: boolean;
+	/**
+	* Render `value` as a markdown *document* (multi-line only,
+	* `rows > 1`): the host renders it through the same markdown
+	* engine as LSP hover docs — headings, emphasis, inline code,
+	* links, syntax-highlighted fences — word-wrapped to the
+	* widget's width. The caret, selection, and Copy operate on
+	* the rendered plain text, so what you copy is what you see.
+	* Markdown mode is **forcibly read-only**: the value only
+	* changes via a spec update.
+	*/
+	markdown: boolean;
 	key?: string | null;
 } | {
 	"kind": "labeledSection";
@@ -2198,6 +2288,27 @@ type CreateVirtualBufferOptions = {
 	*/
 	indentationGuide?: boolean;
 };
+type DiffBaselineResult = {
+	/**
+	* The buffer content version the hunks were computed against (0 for
+	* baseline-pair diffs, which involve no live buffer). A plugin that
+	* renders decorations re-checks this against the buffer's current
+	* version instead of copying buffer text around for coherence.
+	*/
+	revision: bigint;
+	/**
+	* "exact": content-accurate line hunks. "byteCoarse": the buffer's
+	* line index isn't available yet (large file before its line-feed
+	* scan), so no line hunks could be produced; callers fall back to
+	* their own coarse rendering.
+	*/
+	fidelity: "exact" | "byteCoarse";
+	/**
+	* Line hunks, same contract as `computeLineDiff`. Empty means the
+	* sides are equal (when `fidelity` is "exact").
+	*/
+	hunks: Array<LineDiffHunk>;
+};
 type GrepMatch = {
 	/**
 	* Absolute file path
@@ -2262,6 +2373,24 @@ type LanguagePackConfig = {
 	* Formatter configuration
 	*/
 	formatter: FormatterPackConfig | null;
+};
+type LineDiffHunk = {
+	/**
+	* First affected line in the old text (0-based).
+	*/
+	oldStart: number;
+	/**
+	* Number of old-side lines in the hunk (0 for pure insertion).
+	*/
+	oldCount: number;
+	/**
+	* First affected line in the new text (0-based).
+	*/
+	newStart: number;
+	/**
+	* Number of new-side lines in the hunk (0 for pure deletion).
+	*/
+	newCount: number;
 };
 type LocalPath = {
 	kind: "local";
@@ -2361,6 +2490,17 @@ type ScrollbarMarker = {
 	* Optional exclusive end byte offset, making this a range marker.
 	*/
 	end?: number;
+	/**
+	* Optional 0-based end line, **inclusive**, making this a range marker.
+	* Ignored when `end` is present.
+	*
+	* The line counterpart to `end`, for producers that work in line
+	* coordinates — a `git diff` parser knows a hunk's first and last line
+	* but not their byte offsets. Without it such a plugin has to emit one
+	* marker per line to paint a hunk's streak, which costs a byte lookup
+	* and two anchors per line for a resolution the track cannot show.
+	*/
+	endLine?: number;
 	/**
 	* Marker color — RGB array or theme key. Theme keys resolve at render
 	* time, so markers follow theme changes.
@@ -2880,6 +3020,20 @@ interface EditorAPI {
 	* lengths / regex match indices to the byte offsets the editor expects.
 	*/
 	utf8ByteLength(text: string): number;
+	/**
+	* Line-level diff of two texts (native patience diff; see
+	* `fresh_core::diff`). Returns hunks of differing line ranges in
+	* increasing order; equal regions are not reported. Lines are
+	* 0-indexed `\n`-terminated segments (a final unterminated segment
+	* counts as a line), matching the `text.split("\n")`-and-drop-
+	* trailing-empty convention plugins already use for line arrays.
+	* 
+	* Never refuses an input: pathological chunks degrade to coarser
+	* hunks instead of failing, so callers don't need a "diff too
+	* large" path. Runs synchronously on the plugin thread — cost is
+	* near-linear in input size, far below the JS it replaces.
+	*/
+	computeLineDiff(oldText: string, newText: string): LineDiffHunk[];
 	/**
 	* Check if a file exists on the path's filesystem (a window's authority,
 	* or the local host for a `LocalPath`).
@@ -3501,6 +3655,24 @@ interface EditorAPI {
 	*/
 	prompt(label: string, initialValue: string): Promise<string | null>;
 	/**
+	* Open the editor's native Open File browser and wait for a pick
+	* (async) — the terminal analogue of a browser's file-input dialog.
+	* Resolves with the chosen file's absolute path, or null if the
+	* user cancels. The browser anchors where Open File does (the
+	* active file's directory, else the window's working directory),
+	* with the same navigation: Backspace walks up the tree, Tab
+	* descends into directories, and typed input filters or resolves
+	* as a path. No buffer is opened — the path is only returned.
+	* 
+	* `directory` anchors the browser somewhere else (a relative path
+	* resolves against the window's working directory) and typed
+	* relative input then resolves there too. `showHidden` overrides
+	* the config's dotfile visibility for this pick — pass `true` when
+	* the file being picked is itself a dotfile (a tour manifest, an
+	* editorconfig), which the default would hide.
+	*/
+	pickFile(label: string, directory?: string | null, showHidden?: boolean | null): Promise<string | null>;
+	/**
 	* Start an interactive prompt.
 	* 
 	* When `floatingOverlay` is true, the editor renders the prompt
@@ -3944,6 +4116,17 @@ interface EditorAPI {
 	*/
 	showActionPopup(opts: ActionPopupOptions): boolean;
 	/**
+	* Contribute a row to one of the menu bar's menus (e.g. a "Show Dock"
+	* toggle under "View"). The target menu and the neighbour named by
+	* `after` / `before` are matched by stable id (a menu `id`, an item's
+	* `action`) as well as by display label, so the placement survives a
+	* locale change. Naming a menu that doesn't exist is a no-op.
+	* 
+	* Takes a typed AddMenuItemOptions struct - serde validates field
+	* names at runtime.
+	*/
+	addMenuItem(opts: AddMenuItemOptions): boolean;
+	/**
 	* Contribute (or replace, or clear) menu rows for the LSP-Servers
 	* popup. Pass an empty `items` to clear this plugin's slice for
 	* the given language. See `PluginCommand::SetLspMenuContributions`.
@@ -4222,6 +4405,46 @@ interface EditorAPI {
 	*/
 	getBufferText(bufferId: number, start?: number, end?: number): Promise<string>;
 	/**
+	* Register a diff baseline for a buffer (async). `kind` is one of
+	* "saved" | "disk" | "gitRef" | "gitIndex"; `gitRef` carries the ref
+	* for kind "gitRef". Resolves with the baseline id once the
+	* reference content is loaded host-side — no file content ever
+	* crosses the plugin bridge. Baselines are dropped automatically
+	* when their buffer closes, or explicitly via
+	* `releaseDiffBaseline`.
+	*/
+	registerDiffBaseline(bufferId: number, kind: string, gitRef: string | null): Promise<number>;
+	/**
+	* Diff a buffer's live content against a registered baseline
+	* (async). Resolves with a `DiffBaselineResult`; check its
+	* `revision` against the buffer's current version before anchoring
+	* decorations on the hunks.
+	*/
+	diffAgainstBaseline(bufferId: number, baselineId: number): Promise<DiffBaselineResult>;
+	/**
+	* Diff two registered baselines against each other (async) — e.g.
+	* disk vs HEAD, the git-gutter comparison. Resolves with a
+	* `DiffBaselineResult` whose `revision` is 0.
+	*/
+	diffBaselinePair(oldBaselineId: number, newBaselineId: number): Promise<DiffBaselineResult>;
+	/**
+	* Fetch baseline lines for `(startLine, count)` ranges in one
+	* batched call (async). Lines come back without trailing newlines,
+	* grouped per requested range — fetch only the old-side lines a
+	* diff view actually renders.
+	*/
+	getBaselineLines(baselineId: number, ranges: number[][]): Promise<string[][]>;
+	/**
+	* Reload a baseline's reference content (async; call after a HEAD
+	* move or an external write). Resolves once the fresh content is
+	* serving.
+	*/
+	refreshDiffBaseline(baselineId: number): Promise<void>;
+	/**
+	* Drop a registered diff baseline.
+	*/
+	releaseDiffBaseline(baselineId: number): void;
+	/**
 	* Delay/sleep (async, returns request_id)
 	*/
 	delay(durationMs: number): Promise<void>;
@@ -4418,6 +4641,18 @@ interface HookEventMap {
 		buffer_id: number;
 	};
 	after_file_save: {
+		path: string;
+		buffer_id: number;
+	};
+	/**
+	* Fired after a buffer is reloaded from disk: auto-revert picked up an
+	* external change (e.g. `git checkout <ref> -- <file>` in another
+	* terminal), or the user ran an explicit revert. Reloads don't fire
+	* `after_file_save`, so plugins that surface disk-derived state
+	* (git gutter, etc.) should subscribe to this too or their decorations
+	* go stale on every external reset.
+	*/
+	after_file_revert: {
 		path: string;
 		buffer_id: number;
 	};

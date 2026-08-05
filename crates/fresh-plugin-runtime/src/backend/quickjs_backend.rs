@@ -2378,6 +2378,29 @@ impl JsEditorApi {
         text.len() as u32
     }
 
+    /// Line-level diff of two texts (native patience diff; see
+    /// `fresh_core::diff`). Returns hunks of differing line ranges in
+    /// increasing order; equal regions are not reported. Lines are
+    /// 0-indexed `\n`-terminated segments (a final unterminated segment
+    /// counts as a line), matching the `text.split("\n")`-and-drop-
+    /// trailing-empty convention plugins already use for line arrays.
+    ///
+    /// Never refuses an input: pathological chunks degrade to coarser
+    /// hunks instead of failing, so callers don't need a "diff too
+    /// large" path. Runs synchronously on the plugin thread — cost is
+    /// near-linear in input size, far below the JS it replaces.
+    #[plugin_api(ts_return = "LineDiffHunk[]")]
+    pub fn compute_line_diff<'js>(
+        &self,
+        ctx: rquickjs::Ctx<'js>,
+        old_text: String,
+        new_text: String,
+    ) -> rquickjs::Result<Value<'js>> {
+        let hunks = fresh_core::diff::compute_line_diff(&old_text, &new_text);
+        rquickjs_serde::to_value(ctx, &hunks)
+            .map_err(|e| rquickjs::Error::new_from_js_message("serialize", "", &e.to_string()))
+    }
+
     // === File System ===
 
     /// Check if a file exists on the path's filesystem (a window's authority,
@@ -4574,6 +4597,45 @@ impl JsEditorApi {
         id
     }
 
+    /// Open the editor's native Open File browser and wait for a pick
+    /// (async) — the terminal analogue of a browser's file-input dialog.
+    /// Resolves with the chosen file's absolute path, or null if the
+    /// user cancels. The browser anchors where Open File does (the
+    /// active file's directory, else the window's working directory),
+    /// with the same navigation: Backspace walks up the tree, Tab
+    /// descends into directories, and typed input filters or resolves
+    /// as a path. No buffer is opened — the path is only returned.
+    ///
+    /// `directory` anchors the browser somewhere else (a relative path
+    /// resolves against the window's working directory) and typed
+    /// relative input then resolves there too. `showHidden` overrides
+    /// the config's dotfile visibility for this pick — pass `true` when
+    /// the file being picked is itself a dotfile (a tour manifest, an
+    /// editorconfig), which the default would hide.
+    // `Opt<Option<..>>` like `set_prompt_suggestions`: `Opt` accepts the
+    // argument being omitted entirely, `Option` accepts an explicit
+    // `undefined`/`null`, so `pickFile(label)` keeps working unchanged.
+    #[plugin_api(async_promise, js_name = "pickFile", ts_return = "string | null")]
+    #[qjs(rename = "_pickFileStart")]
+    pub fn pick_file_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        label: String,
+        directory: rquickjs::function::Opt<Option<String>>,
+        show_hidden: rquickjs::function::Opt<Option<bool>>,
+    ) -> u64 {
+        let id = self.alloc_request_id();
+
+        let _ = self.command_sender.send(PluginCommand::StartFilePickAsync {
+            label,
+            directory: directory.0.flatten(),
+            show_hidden: show_hidden.0.flatten(),
+            callback_id: JsCallbackId::new(id),
+        });
+
+        id
+    }
+
     /// Start an interactive prompt.
     ///
     /// When `floatingOverlay` is true, the editor renders the prompt
@@ -5842,6 +5904,25 @@ impl JsEditorApi {
             .is_ok()
     }
 
+    /// Contribute a row to one of the menu bar's menus (e.g. a "Show Dock"
+    /// toggle under "View"). The target menu and the neighbour named by
+    /// `after` / `before` are matched by stable id (a menu `id`, an item's
+    /// `action`) as well as by display label, so the placement survives a
+    /// locale change. Naming a menu that doesn't exist is a no-op.
+    ///
+    /// Takes a typed AddMenuItemOptions struct - serde validates field
+    /// names at runtime.
+    pub fn add_menu_item(&self, opts: fresh_core::api::AddMenuItemOptions) -> bool {
+        let (menu_label, item, position) = opts.into_parts();
+        self.command_sender
+            .send(PluginCommand::AddMenuItem {
+                menu_label,
+                item,
+                position,
+            })
+            .is_ok()
+    }
+
     /// Contribute (or replace, or clear) menu rows for the LSP-Servers
     /// popup. Pass an empty `items` to clear this plugin's slice for
     /// the given language. See `PluginCommand::SetLspMenuContributions`.
@@ -6806,6 +6887,136 @@ impl JsEditorApi {
             request_id: id,
         });
         id
+    }
+
+    /// Register a diff baseline for a buffer (async). `kind` is one of
+    /// "saved" | "disk" | "gitRef" | "gitIndex"; `gitRef` carries the ref
+    /// for kind "gitRef". Resolves with the baseline id once the
+    /// reference content is loaded host-side — no file content ever
+    /// crosses the plugin bridge. Baselines are dropped automatically
+    /// when their buffer closes, or explicitly via
+    /// `releaseDiffBaseline`.
+    #[plugin_api(async_promise, js_name = "registerDiffBaseline", ts_return = "number")]
+    #[qjs(rename = "_registerDiffBaselineStart")]
+    pub fn register_diff_baseline_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        buffer_id: u32,
+        kind: String,
+        git_ref: Option<String>,
+    ) -> u64 {
+        let id = self.alloc_request_id();
+        let _ = self
+            .command_sender
+            .send(PluginCommand::RegisterDiffBaseline {
+                buffer_id: BufferId(buffer_id as usize),
+                kind,
+                git_ref,
+                callback_id: JsCallbackId::new(id),
+            });
+        id
+    }
+
+    /// Diff a buffer's live content against a registered baseline
+    /// (async). Resolves with a `DiffBaselineResult`; check its
+    /// `revision` against the buffer's current version before anchoring
+    /// decorations on the hunks.
+    #[plugin_api(
+        async_promise,
+        js_name = "diffAgainstBaseline",
+        ts_return = "DiffBaselineResult"
+    )]
+    #[qjs(rename = "_diffAgainstBaselineStart")]
+    pub fn diff_against_baseline_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        buffer_id: u32,
+        baseline_id: u64,
+    ) -> u64 {
+        let id = self.alloc_request_id();
+        let _ = self
+            .command_sender
+            .send(PluginCommand::DiffAgainstBaseline {
+                buffer_id: BufferId(buffer_id as usize),
+                baseline_id,
+                callback_id: JsCallbackId::new(id),
+            });
+        id
+    }
+
+    /// Diff two registered baselines against each other (async) — e.g.
+    /// disk vs HEAD, the git-gutter comparison. Resolves with a
+    /// `DiffBaselineResult` whose `revision` is 0.
+    #[plugin_api(
+        async_promise,
+        js_name = "diffBaselinePair",
+        ts_return = "DiffBaselineResult"
+    )]
+    #[qjs(rename = "_diffBaselinePairStart")]
+    pub fn diff_baseline_pair_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        old_baseline_id: u64,
+        new_baseline_id: u64,
+    ) -> u64 {
+        let id = self.alloc_request_id();
+        let _ = self.command_sender.send(PluginCommand::DiffBaselinePair {
+            old_baseline_id,
+            new_baseline_id,
+            callback_id: JsCallbackId::new(id),
+        });
+        id
+    }
+
+    /// Fetch baseline lines for `(startLine, count)` ranges in one
+    /// batched call (async). Lines come back without trailing newlines,
+    /// grouped per requested range — fetch only the old-side lines a
+    /// diff view actually renders.
+    #[plugin_api(async_promise, js_name = "getBaselineLines", ts_return = "string[][]")]
+    #[qjs(rename = "_getBaselineLinesStart")]
+    pub fn get_baseline_lines_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        baseline_id: u64,
+        ranges: Vec<Vec<u32>>,
+    ) -> u64 {
+        let id = self.alloc_request_id();
+        let ranges: Vec<(u32, u32)> = ranges
+            .into_iter()
+            .filter_map(|r| match r.as_slice() {
+                [start, count] => Some((*start, *count)),
+                _ => None,
+            })
+            .collect();
+        let _ = self.command_sender.send(PluginCommand::GetBaselineLines {
+            baseline_id,
+            ranges,
+            callback_id: JsCallbackId::new(id),
+        });
+        id
+    }
+
+    /// Reload a baseline's reference content (async; call after a HEAD
+    /// move or an external write). Resolves once the fresh content is
+    /// serving.
+    #[plugin_api(async_promise, js_name = "refreshDiffBaseline", ts_return = "void")]
+    #[qjs(rename = "_refreshDiffBaselineStart")]
+    pub fn refresh_diff_baseline_start(&self, _ctx: rquickjs::Ctx<'_>, baseline_id: u64) -> u64 {
+        let id = self.alloc_request_id();
+        let _ = self
+            .command_sender
+            .send(PluginCommand::RefreshDiffBaseline {
+                baseline_id,
+                callback_id: JsCallbackId::new(id),
+            });
+        id
+    }
+
+    /// Drop a registered diff baseline.
+    pub fn release_diff_baseline(&self, baseline_id: u64) {
+        let _ = self
+            .command_sender
+            .send(PluginCommand::ReleaseDiffBaseline { baseline_id });
     }
 
     /// Delay/sleep (async, returns request_id)

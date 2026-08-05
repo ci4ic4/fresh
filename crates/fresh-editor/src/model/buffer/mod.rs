@@ -970,6 +970,15 @@ impl TextBuffer {
     /// Diff the current piece tree against the last saved snapshot.
     ///
     /// See `Persistence::diff_since_saved` for the algorithm.
+    /// Version of the state [`Self::diff_since_saved`] compares against.
+    ///
+    /// Changes on save, reload, and the first edit after either. A cache that
+    /// keys only on [`Self::version`] would miss a save, which replaces the
+    /// saved snapshot while leaving the content untouched.
+    pub fn save_state_version(&self) -> u64 {
+        self.persistence.save_state_version()
+    }
+
     pub fn diff_since_saved(&self) -> PieceTreeDiff {
         let _span = tracing::info_span!(
             "diff_since_saved",
@@ -980,7 +989,19 @@ impl TextBuffer {
         .entered();
 
         self.persistence
-            .diff_since_saved(&self.piece_tree, &self.buffers)
+            .diff_since_saved(&self.piece_tree, &self.buffers, self.version)
+    }
+
+    /// Total bytes of the saved snapshot (the diff baseline's old side).
+    pub fn saved_total_bytes(&self) -> usize {
+        self.persistence.saved_total_bytes()
+    }
+
+    /// Read a byte range out of the saved snapshot. `None` when any piece
+    /// in the range is unreadable (unloaded chunk data).
+    pub fn extract_saved_range(&self, start: usize, end: usize) -> Option<Vec<u8>> {
+        self.persistence
+            .extract_saved_range(start, end, &self.buffers)
     }
 
     /// Convert a byte offset to a line/column position
@@ -2630,6 +2651,70 @@ impl TextBuffer {
         }
     }
 
+    /// Find every non-overlapping occurrence of `pattern` within a byte range,
+    /// in a single streaming pass, stopping after `limit` matches.
+    ///
+    /// Calling [`find_next_in_range`](Self::find_next_in_range) once per match
+    /// re-reads a whole chunk from the piece tree per call, so collecting every
+    /// match of a common word in a multi-megabyte file spent most of its time
+    /// re-reading the same bytes (issue #2893). This walks the chunks once.
+    pub fn find_all_in_range(
+        &self,
+        pattern: &str,
+        range: Range<usize>,
+        limit: usize,
+    ) -> Vec<usize> {
+        let mut matches = Vec::new();
+        let pattern_bytes = pattern.as_bytes();
+        if pattern_bytes.is_empty() || limit == 0 {
+            return matches;
+        }
+
+        let start = range.start;
+        let end = range.end.min(self.len());
+        if start >= end {
+            return matches;
+        }
+
+        const CHUNK_SIZE: usize = 65536; // 64KB chunks, as in find_pattern
+        let overlap = pattern_bytes.len().saturating_sub(1).max(1);
+
+        // Matches must not overlap each other, and a match straddling a chunk
+        // boundary is reported by exactly one chunk — the one whose valid zone
+        // it ends in, mirroring `find_pattern`.
+        let mut next_allowed = start;
+
+        for chunk in OverlappingChunks::new(self, start, end, CHUNK_SIZE, overlap) {
+            let mut search_from = 0;
+            while let Some(offset) =
+                Self::find_in_bytes(&chunk.buffer[search_from..], pattern_bytes)
+            {
+                let pos = search_from + offset;
+                let absolute_pos = chunk.absolute_pos + pos;
+                let match_end = pos + pattern_bytes.len();
+
+                if match_end <= chunk.valid_start
+                    || absolute_pos < next_allowed
+                    || absolute_pos + pattern_bytes.len() > end
+                {
+                    // Already reported, overlapping a previous match, or past
+                    // the range: resume just after this candidate's start.
+                    search_from = pos + 1;
+                    continue;
+                }
+
+                matches.push(absolute_pos);
+                if matches.len() >= limit {
+                    return matches;
+                }
+                next_allowed = absolute_pos + pattern_bytes.len();
+                search_from = match_end;
+            }
+        }
+
+        matches
+    }
+
     /// Find pattern in a byte range using overlapping chunks
     fn find_pattern(&self, start: usize, end: usize, pattern: &[u8]) -> Option<usize> {
         if pattern.is_empty() || start >= end {
@@ -3337,6 +3422,12 @@ impl TextBuffer {
     }
 
     // Test helper methods
+
+    /// Test-only access to persistence internals (diff-memo assertions).
+    #[cfg(test)]
+    pub(crate) fn persistence_for_test(&self) -> &Persistence {
+        &self.persistence
+    }
 
     /// Create a buffer from a string for testing
     #[cfg(test)]

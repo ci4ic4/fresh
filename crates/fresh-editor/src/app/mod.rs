@@ -16,6 +16,7 @@ mod clipboard;
 mod composite_buffer_actions;
 mod dabbrev_actions;
 mod diagnostic_jumps;
+pub(crate) mod diff_baselines;
 mod editor_accessors;
 mod editor_init;
 mod event_apply;
@@ -949,6 +950,15 @@ pub struct Editor {
     #[cfg(feature = "plugins")]
     grep_project_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 
+    /// Registered diff baselines (registerDiffBaseline plugin API family).
+    /// Shared with off-loop loader tasks; see `app/diff_baselines.rs`.
+    #[cfg(feature = "plugins")]
+    diff_baselines: crate::app::diff_baselines::BaselineStore,
+
+    /// Next baseline id to allocate (editor thread only).
+    #[cfg(feature = "plugins")]
+    next_diff_baseline_id: u64,
+
     /// Async messages the frame budget deferred, in arrival order. Drained
     /// ahead of the bridges on the next tick.
     async_message_backlog: std::collections::VecDeque<crate::services::async_bridge::AsyncMessage>,
@@ -1226,6 +1236,19 @@ pub struct Editor {
     pub(crate) dock_width: Option<u16>,
     /// True while the user is dragging the dock's right border to resize.
     pub(crate) dock_resizing: bool,
+    /// In-flight mouse drag-to-select on a widget markdown/text document:
+    /// armed by the press that placed the caret, extended on every Drag,
+    /// cleared on button-up. `anchor_flat` is the press position as a
+    /// flat byte offset into the widget's shadow TextEdit value.
+    pub(crate) widget_text_drag: Option<WidgetTextDrag>,
+}
+
+/// See [`Editor::widget_text_drag`].
+#[derive(Debug, Clone)]
+pub(crate) struct WidgetTextDrag {
+    pub panel: crate::widgets::PanelKey,
+    pub widget: String,
+    pub anchor_flat: usize,
 }
 
 /// Sentinel `BufferId` registered with the widget registry for the
@@ -1398,6 +1421,14 @@ pub(crate) struct FloatingWidgetState {
     /// (web mode) since geometry is computed there without painting cells.
     /// `None` when the panel isn't a closable `Centered` modal.
     pub close_button_rect: Option<ratatui::layout::Rect>,
+    /// Widget key the pointer is currently over, tracked from mouse-move
+    /// events against this panel's hit areas. Empty for "nothing hovered".
+    ///
+    /// Feeds `RenderContext::hover_key` on the next render, where widgets
+    /// carrying a `hover_style` compare it against their own key. Only a
+    /// crossing between widgets changes it, so motion inside one control
+    /// costs nothing.
+    pub hovered_widget_key: String,
     /// The open `Dropdown`'s option list, surfaced by the widget renderer
     /// for a screen-level floating pop-over (drawn by
     /// `render_floating_widget_panel` at the trigger's screen row, clipped
@@ -1967,6 +1998,7 @@ mod tests {
             title: None,
             closable: false,
             close_button_rect: None,
+            hovered_widget_key: String::new(),
             dropdown_popup: None,
             dropdown_popup_hits: Vec::new(),
             dropdown_popup_rect: None,

@@ -590,6 +590,47 @@ pub struct BufferSavedDiff {
     pub byte_ranges: Vec<Range<usize>>,
 }
 
+/// Result of a host-side baseline diff (`diffAgainstBaseline` /
+/// `diffBaselinePair`).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct DiffBaselineResult {
+    /// The buffer content version the hunks were computed against (0 for
+    /// baseline-pair diffs, which involve no live buffer). A plugin that
+    /// renders decorations re-checks this against the buffer's current
+    /// version instead of copying buffer text around for coherence.
+    pub revision: u64,
+    /// "exact": content-accurate line hunks. "byteCoarse": the buffer's
+    /// line index isn't available yet (large file before its line-feed
+    /// scan), so no line hunks could be produced; callers fall back to
+    /// their own coarse rendering.
+    #[ts(type = "\"exact\" | \"byteCoarse\"")]
+    pub fidelity: String,
+    /// Line hunks, same contract as `computeLineDiff`. Empty means the
+    /// sides are equal (when `fidelity` is "exact").
+    pub hunks: Vec<LineDiffHunk>,
+}
+
+/// One hunk from `computeLineDiff`: a maximal run of differing lines.
+/// Line indices are 0-based; a line is a `\n`-terminated (or final
+/// unterminated) segment of the input text. `old_count == 0` is a pure
+/// insertion, `new_count == 0` a pure deletion, both non-zero a
+/// replacement. Equal regions between hunks are not reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct LineDiffHunk {
+    /// First affected line in the old text (0-based).
+    pub old_start: u32,
+    /// Number of old-side lines in the hunk (0 for pure insertion).
+    pub old_count: u32,
+    /// First affected line in the new text (0-based).
+    pub new_start: u32,
+    /// Number of new-side lines in the hunk (0 for pure deletion).
+    pub new_count: u32,
+}
+
 /// Information about the viewport
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -1005,6 +1046,18 @@ pub struct ScrollbarMarker {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub end: Option<u32>,
+
+    /// Optional 0-based end line, **inclusive**, making this a range marker.
+    /// Ignored when `end` is present.
+    ///
+    /// The line counterpart to `end`, for producers that work in line
+    /// coordinates — a `git diff` parser knows a hunk's first and last line
+    /// but not their byte offsets. Without it such a plugin has to emit one
+    /// marker per line to paint a hunk's streak, which costs a byte lookup
+    /// and two anchors per line for a resolution the track cannot show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub end_line: Option<u32>,
 
     /// Marker color — RGB array or theme key. Theme keys resolve at render
     /// time, so markers follow theme changes.
@@ -2111,6 +2164,8 @@ pub enum WidgetSpec {
     /// Action button, rendered as `[ Label ]` (or `[ Label ]` with
     /// emphasized styling for `Primary`/`Danger`). Focused buttons
     /// flip foreground/background using the active menu theme keys.
+    /// Set `bare` to drop the frame and render the label alone, and
+    /// `hover_style` to give it a look under the pointer.
     ///
     /// `intent` is the button's visual role (`Normal` / `Primary` /
     /// `Danger`); the field is named `intent` rather than `kind`
@@ -2141,6 +2196,40 @@ pub enum WidgetSpec {
         /// are tabbable).
         #[serde(default = "default_true")]
         focusable: bool,
+        /// Render the label alone — no `[ ]` frame, no focus-marker
+        /// gutter — turning the button into a bare *icon affordance*
+        /// (a `×` close glyph, a `▾` chevron) rather than a framed
+        /// action. Use it where the glyph itself is the control and a
+        /// frame would read as clutter; keep the default `false` for
+        /// anything with a word on it.
+        ///
+        /// This controls layout only; `hover_style` controls how the
+        /// button looks under the pointer.
+        #[serde(default)]
+        bare: bool,
+        /// Style applied while the pointer is over this button. `None`
+        /// (the default) leaves it looking the same hovered as not.
+        ///
+        /// Hover is host state — it changes with mouse motion and no
+        /// plugin round-trip — so the plugin declares the *appearance*
+        /// once in the spec and the host applies it as the pointer
+        /// moves. Nothing crosses the plugin bridge on a hover.
+        ///
+        /// It outranks focus styling while both apply: the pointer is
+        /// the more immediate signal, and the one the user is actively
+        /// driving.
+        ///
+        /// For a close glyph, `ui.tab_close_hover_fg` is the editor's
+        /// shared "close affordance under the pointer" key — the tab
+        /// `×` and the file explorer's `×` both read it, so a plugin
+        /// naming it gets the same highlight users already know.
+        ///
+        /// `Button` is the first kind to carry this; other widget kinds
+        /// adopt it with the same field plus a `ctx.is_hovered(key)`
+        /// check in their renderer.
+        #[ts(type = "Partial<OverlayOptions>")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hover_style: Option<OverlayOptions>,
     },
     /// Horizontal whitespace eater. In a `Row`, produces `cols`
     /// spaces (or fills remaining width if `flex: true`); in a
@@ -2465,6 +2554,21 @@ pub enum WidgetSpec {
         /// narrow surfaces.
         #[serde(default)]
         label_width: u32,
+        /// Reject every mutating operation (typing, Backspace/Delete,
+        /// Cut, Paste) while keeping caret motion, selection, and Copy.
+        /// Implied by `markdown`.
+        #[serde(default)]
+        read_only: bool,
+        /// Render `value` as a markdown *document* (multi-line only,
+        /// `rows > 1`): the host renders it through the same markdown
+        /// engine as LSP hover docs — headings, emphasis, inline code,
+        /// links, syntax-highlighted fences — word-wrapped to the
+        /// widget's width. The caret, selection, and Copy operate on
+        /// the rendered plain text, so what you copy is what you see.
+        /// Markdown mode is **forcibly read-only**: the value only
+        /// changes via a spec update.
+        #[serde(default)]
+        markdown: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key: Option<String>,
     },
@@ -3638,6 +3742,23 @@ pub enum PluginCommand {
         callback_id: JsCallbackId,
     },
 
+    /// Open the editor's native Open File browser and resolve the chosen
+    /// file's absolute path via callback — the terminal analogue of a
+    /// browser's file-input dialog. Resolves null when the user cancels.
+    /// The browser anchors where Open File does (the active file's
+    /// directory, else the window's working directory), with the same
+    /// navigation: Backspace up the tree, Tab to descend, hidden toggle.
+    /// `directory` overrides the anchor (relative paths resolve against
+    /// the working directory); `show_hidden` overrides the config's
+    /// dotfile default — a picker for files that *are* dotfiles (e.g.
+    /// `.fresh-tour.json`) is useless without it.
+    StartFilePickAsync {
+        label: String,
+        directory: Option<String>,
+        show_hidden: Option<bool>,
+        callback_id: JsCallbackId,
+    },
+
     /// Request the next keypress for the calling plugin.
     ///
     /// The editor enqueues `callback_id` and resolves it with a
@@ -4600,6 +4721,58 @@ pub enum PluginCommand {
     /// already-exited groups: callers can retry safely.
     SignalWindow { id: WindowId, signal: String },
 
+    /// Register a diff baseline for `buffer_id` (async). `kind` is one of
+    /// "saved" | "disk" | "gitRef" | "gitIndex"; `git_ref` carries the ref
+    /// for "gitRef". Disk and git baselines load their content off-loop
+    /// (filesystem read / `git show` on the window's authority); the
+    /// promise resolves with the baseline id once content is ready.
+    RegisterDiffBaseline {
+        buffer_id: BufferId,
+        kind: String,
+        git_ref: Option<String>,
+        callback_id: JsCallbackId,
+    },
+
+    /// Diff `buffer_id`'s live content against a registered baseline
+    /// (async). Resolves with a `DiffBaselineResult`. No buffer text
+    /// crosses the plugin bridge in either direction.
+    DiffAgainstBaseline {
+        buffer_id: BufferId,
+        baseline_id: u64,
+        callback_id: JsCallbackId,
+    },
+
+    /// Diff two registered baselines against each other (async) — e.g.
+    /// disk vs HEAD, the git-gutter comparison. Resolves with a
+    /// `DiffBaselineResult` whose `revision` is 0.
+    DiffBaselinePair {
+        old_baseline_id: u64,
+        new_baseline_id: u64,
+        callback_id: JsCallbackId,
+    },
+
+    /// Fetch baseline line contents for the given `(start_line, count)`
+    /// ranges (async, one batched call). Lines are returned without their
+    /// trailing newline, grouped per requested range — how a diff view
+    /// fetches only the old-side lines it actually renders.
+    GetBaselineLines {
+        baseline_id: u64,
+        ranges: Vec<(u32, u32)>,
+        callback_id: JsCallbackId,
+    },
+
+    /// Reload a baseline's content (async; e.g. after a HEAD move or an
+    /// external write) and bump its generation. Resolves when the new
+    /// content is in place.
+    RefreshDiffBaseline {
+        baseline_id: u64,
+        callback_id: JsCallbackId,
+    },
+
+    /// Drop a registered baseline. Baselines are also dropped
+    /// automatically when their buffer closes.
+    ReleaseDiffBaseline { baseline_id: u64 },
+
     /// Project-wide grep search (async)
     /// Searches all project files via FileSystem trait, respecting .gitignore.
     /// For open buffers with dirty edits, searches the buffer's piece tree.
@@ -5073,6 +5246,72 @@ pub struct LspMenuItem {
     pub id: String,
     /// Display label shown in the popup row.
     pub label: String,
+}
+
+/// Options for `addMenuItem` — one plugin-contributed row in an existing
+/// menu bar menu. See `PluginCommand::AddMenuItem`.
+///
+/// Every string here is matched or displayed by the host, so the plugin
+/// never reaches into menu internals: it names the *target* menu and,
+/// optionally, the neighbour to sit next to. Both lookups accept a stable
+/// identifier (a menu `id` like `"View"`, an item's `action` like
+/// `"toggle_file_explorer"`) as well as a display label, so a plugin can
+/// place its row without knowing the user's locale.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct AddMenuItemOptions {
+    /// Target menu, matched against each menu's stable `id` ("View",
+    /// "File", …) first and its display label second. A menu that matches
+    /// neither is left alone and the call is a no-op.
+    pub menu: String,
+    /// Row label, already localised by the plugin (`editor.t(…)`).
+    pub label: String,
+    /// Action dispatched when the row is chosen. A name the editor doesn't
+    /// know is routed to the plugin action of the same name — i.e. the
+    /// handler registered with `registerHandler`.
+    pub action: String,
+    /// Menu-context key whose boolean value renders the row's checkmark
+    /// (e.g. `"dock"`). Omit for a plain action row.
+    #[serde(default)]
+    #[ts(optional)]
+    pub checkbox: Option<String>,
+    /// Menu-context key gating whether the row is enabled. Omit for a row
+    /// that is always available.
+    #[serde(default)]
+    #[ts(optional)]
+    pub when: Option<String>,
+    /// Insert directly after the existing row whose action or label this
+    /// names. Ignored when nothing matches (the row is appended instead).
+    #[serde(default)]
+    #[ts(optional)]
+    pub after: Option<String>,
+    /// Insert directly before the existing row whose action or label this
+    /// names. Ignored when `after` is set, or when nothing matches.
+    #[serde(default)]
+    #[ts(optional)]
+    pub before: Option<String>,
+}
+
+impl AddMenuItemOptions {
+    /// Split into the `(menu_label, item, position)` triple
+    /// `PluginCommand::AddMenuItem` carries. `after` wins over `before`
+    /// when a plugin passes both; with neither, the row is appended.
+    pub fn into_parts(self) -> (String, MenuItem, MenuPosition) {
+        let position = match (self.after, self.before) {
+            (Some(a), _) => MenuPosition::After(a),
+            (None, Some(b)) => MenuPosition::Before(b),
+            (None, None) => MenuPosition::Bottom,
+        };
+        let item = MenuItem::Action {
+            label: self.label,
+            action: self.action,
+            args: HashMap::new(),
+            when: self.when,
+            checkbox: self.checkbox,
+        };
+        (self.menu, item, position)
+    }
 }
 
 /// Options for showActionPopup
@@ -5811,6 +6050,7 @@ mod fromjs_impls {
         ActionSpec,
         ActionPopupAction,
         ActionPopupOptions,
+        AddMenuItemOptions,
         LspMenuItem,
         ViewTokenWire,
         ViewTokenStyle,
