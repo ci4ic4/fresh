@@ -746,6 +746,20 @@ pub enum Action {
     ToggleLineWrapCurrentBuffer,
     /// Toggle virtual space (off ↔ on) for the current buffer only
     ToggleVirtualSpaceCurrentBuffer,
+    /// Toggle indentation guides for the current buffer only (per-buffer
+    /// override that persists across restart, without touching the global
+    /// `editor.indentation_guide` mode or other buffers).
+    ToggleIndentationGuideCurrentBuffer,
+    /// Toggle the gutter folding indicators for the current buffer only
+    /// (per-buffer override that persists across restart). Existing folds are
+    /// left alone; only the ▾/▸ arrows are hidden.
+    ToggleFoldIndicatorsCurrentBuffer,
+    /// Toggle the current-line highlight for the current buffer only
+    /// (per-buffer override that persists across restart).
+    ToggleCurrentLineHighlightCurrentBuffer,
+    /// Toggle occurrence highlighting for the current buffer only
+    /// (per-buffer override that persists across restart).
+    ToggleOccurrenceHighlightCurrentBuffer,
     /// Playful full-screen wave that bounces all painted content around.
     TriggerWaveAnimation,
     ToggleScrollSync,
@@ -1231,6 +1245,10 @@ impl Action {
             "toggle_line_numbers_current_buffer" => ToggleLineNumbersCurrentBuffer,
             "toggle_line_wrap_current_buffer" => ToggleLineWrapCurrentBuffer,
             "toggle_virtual_space_current_buffer" => ToggleVirtualSpaceCurrentBuffer,
+            "toggle_indentation_guide_current_buffer" => ToggleIndentationGuideCurrentBuffer,
+            "toggle_fold_indicators_current_buffer" => ToggleFoldIndicatorsCurrentBuffer,
+            "toggle_current_line_highlight_current_buffer" => ToggleCurrentLineHighlightCurrentBuffer,
+            "toggle_occurrence_highlight_current_buffer" => ToggleOccurrenceHighlightCurrentBuffer,
             "trigger_wave_animation" => TriggerWaveAnimation,
             "toggle_scroll_sync" => ToggleScrollSync,
             "toggle_mouse_capture" => ToggleMouseCapture,
@@ -1864,6 +1882,42 @@ impl KeybindingResolver {
                 | Action::ShowKeyboardShortcuts
                 | Action::PromptCancel  // Esc should always cancel
                 | Action::PopupCancel // Esc should always cancel
+        )
+    }
+
+    /// Whether an action mutates the active buffer's text, and so needs a
+    /// buffer that accepts edits.
+    ///
+    /// The handlers already refuse when `editing_disabled` is set — this is the
+    /// same question asked one step earlier, so the command palette and the
+    /// menus can grey the entry out instead of letting the user pick it and get
+    /// "editing is disabled for this buffer" back.
+    pub fn is_buffer_mutating_action(action: &Action) -> bool {
+        matches!(
+            action,
+            Action::Undo
+                | Action::Redo
+                | Action::Cut
+                | Action::Paste
+                | Action::DeleteLine
+                | Action::DeleteWordBackward
+                | Action::DeleteWordForward
+                | Action::DeleteToLineEnd
+                | Action::TransposeChars
+                | Action::ToUpperCase
+                | Action::ToLowerCase
+                | Action::SortLines
+                | Action::OpenLine
+                | Action::DuplicateLine
+                | Action::ToggleComment
+                | Action::DedentSelection
+                | Action::Replace
+                | Action::QueryReplace
+                | Action::FormatBuffer
+                | Action::TrimTrailingWhitespace
+                | Action::EnsureFinalNewline
+                | Action::LspRename
+                | Action::ShellCommandReplace
         )
     }
 
@@ -2782,6 +2836,18 @@ impl KeybindingResolver {
             Action::ToggleLineWrapCurrentBuffer => t!("action.toggle_line_wrap_current_buffer"),
             Action::ToggleVirtualSpaceCurrentBuffer => {
                 t!("action.toggle_virtual_space_current_buffer")
+            }
+            Action::ToggleIndentationGuideCurrentBuffer => {
+                t!("action.toggle_indentation_guide_current_buffer")
+            }
+            Action::ToggleFoldIndicatorsCurrentBuffer => {
+                t!("action.toggle_fold_indicators_current_buffer")
+            }
+            Action::ToggleCurrentLineHighlightCurrentBuffer => {
+                t!("action.toggle_current_line_highlight_current_buffer")
+            }
+            Action::ToggleOccurrenceHighlightCurrentBuffer => {
+                t!("action.toggle_occurrence_highlight_current_buffer")
             }
             Action::TriggerWaveAnimation => t!("action.trigger_wave_animation"),
             Action::ToggleScrollSync => t!("action.toggle_scroll_sync"),

@@ -289,6 +289,49 @@ pub struct SerializedFileState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_space: Option<crate::config::VirtualSpaceMode>,
 
+    /// Explicit per-buffer indentation-guide override (`None` = follow the
+    /// global `editor.indentation_guide` mode). Persists the "Toggle
+    /// Indentation Guides (Current Buffer)" choice across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indentation_guide: Option<bool>,
+
+    /// Explicit per-buffer folding-indicator override (`None` = show them).
+    /// Persists the "Toggle Folding Indicators (Current Buffer)" choice across
+    /// restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fold_indicators: Option<bool>,
+
+    /// Explicit per-buffer indentation-style override (`None` = follow the
+    /// language default). Persists the "Toggle Indentation: Spaces ↔ Tabs
+    /// (Current Buffer)" choice across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_tabs: Option<bool>,
+
+    /// Explicit per-buffer whitespace-indicator master override (`None` =
+    /// follow config). Persists the "Toggle Whitespace Indicators (Current
+    /// Buffer)" / "Toggle Tab Indicators (Current Buffer)" choice across
+    /// restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whitespace_indicators: Option<bool>,
+
+    /// Explicit per-buffer tab-indicator override, layered on top of
+    /// `whitespace_indicators` (`None` = follow the master/config resolution).
+    /// Persists the "Toggle Tab Indicators (Current Buffer)" choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_indicators: Option<bool>,
+
+    /// Explicit per-buffer current-line-highlight override (`None` = follow the
+    /// global default). Persists the "Toggle Current Line Highlight (Current
+    /// Buffer)" choice across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight_current_line: Option<bool>,
+
+    /// Explicit per-buffer occurrence-highlight override (`None` = follow the
+    /// global default). Persists the "Toggle Occurrence Highlight (Current
+    /// Buffer)" choice across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight_occurrences: Option<bool>,
+
     /// Plugin-managed state (arbitrary key-value pairs, persisted across sessions)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub plugin_state: HashMap<String, serde_json::Value>,
@@ -1462,6 +1505,13 @@ mod tests {
             line_numbers: None,
             line_wrap: None,
             virtual_space: None,
+            indentation_guide: None,
+            fold_indicators: None,
+            use_tabs: None,
+            whitespace_indicators: None,
+            tab_indicators: None,
+            highlight_current_line: None,
+            highlight_occurrences: None,
             plugin_state: HashMap::new(),
             folds: Vec::new(),
         };

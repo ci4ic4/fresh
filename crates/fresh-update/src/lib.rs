@@ -36,12 +36,28 @@
 pub mod channel;
 pub mod check;
 pub mod confidence;
+pub mod elevate;
+pub mod endpoint;
+pub mod feed;
 pub mod heuristic;
 pub mod provenance;
 pub mod receipt;
 pub mod registry;
 pub mod self_update;
+pub mod staging;
 pub mod version;
+
+#[cfg(feature = "archive")]
+pub mod archive;
+#[cfg(feature = "engine")]
+pub mod engine;
+#[cfg(feature = "net")]
+pub mod net;
+pub mod offer;
+
+#[cfg(feature = "engine")]
+pub use engine::{UpdateOptions, UpdateStatus};
+pub use offer::{offer_for, UpdateChoice, UpdateOffer};
 
 pub use channel::{Channel, ParseChannelError};
 pub use check::{evaluate, ReleaseCheck};
@@ -54,6 +70,17 @@ pub use registry::{kind_for, plan, UpdateKind, UpdatePlan};
 /// `x86_64-unknown-linux-gnu`), captured by `build.rs`. Used to pick the
 /// matching release asset during self-update.
 pub const TARGET_TRIPLE: &str = env!("FRESH_UPDATE_TARGET");
+
+/// Exit code from `fresh --cmd update` meaning: the update was **not** applied,
+/// and finishing it needs a step we will not take on the user's behalf — a
+/// privileged `dpkg -i`/`rpm -U`, a package-manager command we only print, or a
+/// manual download.
+///
+/// This is a third outcome, distinct from success (`0`) and failure (`1`).
+/// Nothing went wrong, so reporting it as a failure is a lie; nothing was
+/// installed either, so reporting success is the opposite lie. The editor's
+/// update indicator keys its `ActionRequired` state off this code.
+pub const EXIT_ACTION_REQUIRED: i32 = 2;
 
 /// The build-time install channel embedded via `FRESH_BUILD_CHANNEL`, if any.
 /// `None` for the shared prebuilt archive and ordinary developer builds.

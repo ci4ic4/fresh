@@ -178,6 +178,11 @@ struct Args {
     update_check: bool,
     update_yes: bool,
     update_allow_downgrade: bool,
+    update_print_command: bool,
+    update_download_only: bool,
+    update_force: bool,
+    update_releases_url: Option<String>,
+    update_download_base: Option<String>,
     locale: Option<String>,
     check_plugin: Option<PathBuf>,
     init: Option<Option<String>>,
@@ -214,11 +219,35 @@ impl From<Cli> for Args {
             false
         };
 
-        // `fresh --cmd update [--check] [--yes] [--allow-downgrade]`
+        // `fresh --cmd update [--check] [--yes] [--allow-downgrade] [--force]
+        //                     [--print-command] [--releases-url U] [--download-base U]`
         let update = cli.cmd.first().map(String::as_str) == Some("update");
         let update_check = update && cli.cmd.iter().any(|a| a == "--check");
         let update_yes = update && cli.cmd.iter().any(|a| a == "--yes" || a == "-y");
         let update_allow_downgrade = update && cli.cmd.iter().any(|a| a == "--allow-downgrade");
+        let update_print_command = update && cli.cmd.iter().any(|a| a == "--print-command");
+        let update_download_only = update && cli.cmd.iter().any(|a| a == "--download-only");
+        let update_force = update && cli.cmd.iter().any(|a| a == "--force");
+        // Value flags: `--flag VALUE`. Point the update at a mirror of the
+        // release feed — an air-gapped/enterprise mirror in production, and the
+        // way the packaging containers exercise the real install flow in tests.
+        let flag_value = |name: &str| -> Option<String> {
+            cli.cmd
+                .iter()
+                .position(|a| a == name)
+                .and_then(|i| cli.cmd.get(i + 1))
+                .cloned()
+        };
+        let update_releases_url = if update {
+            flag_value("--releases-url")
+        } else {
+            None
+        };
+        let update_download_base = if update {
+            flag_value("--download-base")
+        } else {
+            None
+        };
 
         // Parse --cmd arguments to determine command
         let (
@@ -483,6 +512,11 @@ impl From<Cli> for Args {
             update_check,
             update_yes,
             update_allow_downgrade,
+            update_print_command,
+            update_download_only,
+            update_force,
+            update_releases_url,
+            update_download_base,
             locale: cli.locale,
             check_plugin: cli.check_plugin,
             init,
@@ -4332,27 +4366,65 @@ fn show_paths_command() -> AnyhowResult<()> {
     Ok(())
 }
 
-/// Handle `fresh update [--check] [--yes] [--allow-downgrade]`.
+/// Handle `fresh update [--check] [--yes] [--allow-downgrade] [--force]
+///                       [--download-only] [--print-command]
+///                       [--releases-url U] [--download-base U]`.
 fn update_command(args: &Args) -> AnyhowResult<()> {
     #[cfg(feature = "self-update")]
     {
-        let opts = fresh::services::updater::UpdateOptions {
+        // The env vars are read inside `Endpoints::from_env`, so the
+        // background check and the update child the popup spawns agree on
+        // where releases come from. The CLI flags override on top, and go
+        // through the same policy: an endpoint that leaves the pinned host
+        // list is refused outright in a release build, and marks the run
+        // untrusted (no privileged install) in one that permits it.
+        let mut endpoints = match fresh_update::endpoint::Endpoints::from_env() {
+            Ok(ep) => ep,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Some(url) = args.update_releases_url.clone() {
+            endpoints.releases_url = url;
+            endpoints.trusted = false;
+        }
+        if let Some(base) = args.update_download_base.clone() {
+            endpoints.download_base = base;
+            endpoints.trusted = false;
+        }
+        let opts = fresh_update::engine::UpdateOptions {
             check_only: args.update_check,
             yes: args.update_yes,
             allow_downgrade: args.update_allow_downgrade,
-            ..Default::default()
+            // Three rungs, most automatic first. `--print-command` wins if
+            // both are given: it is the one that promises to touch nothing,
+            // and a promise like that should not be overridden by accident.
+            execution: if args.update_print_command {
+                fresh_update::engine::Execution::PrintOnly
+            } else if args.update_download_only {
+                fresh_update::engine::Execution::DownloadOnly
+            } else {
+                fresh_update::engine::Execution::Install
+            },
+            force: args.update_force,
+            endpoints,
         };
         // Map the outcome to a process exit code without an anyhow backtrace
         // (the editor's update terminal keys the indicator off this exit
         // status, and a backtrace there is pure noise):
         //   - Done            -> exit 0
-        //   - ManualRequired  -> exit non-zero, but run() already printed
-        //                        friendly guidance, so add nothing here
-        //   - Err             -> clean one-line "Error: <msg>", exit non-zero
-        use fresh::services::updater::UpdateStatus;
-        match fresh::services::updater::run(&opts) {
+        //   - ActionRequired  -> exit EXIT_ACTION_REQUIRED, a code distinct
+        //                        from both success and failure; run() already
+        //                        printed what the user has to do, so add
+        //                        nothing here
+        //   - Err             -> clean one-line "Error: <msg>", exit 1
+        use fresh_update::engine::UpdateStatus;
+        match fresh_update::engine::run(fresh::services::release_checker::CURRENT_VERSION, &opts) {
             Ok(UpdateStatus::Done) => Ok(()),
-            Ok(UpdateStatus::ManualRequired) => std::process::exit(1),
+            Ok(UpdateStatus::ActionRequired) => {
+                std::process::exit(fresh_update::EXIT_ACTION_REQUIRED)
+            }
             Err(e) => {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
@@ -5135,6 +5207,7 @@ fn real_main() -> AnyhowResult<()> {
             } else if matches!(
                 plan.kind,
                 fresh::services::release_checker::UpdateKind::SelfContained
+                    | fresh::services::release_checker::UpdateKind::DownloadPackage
             ) {
                 eprintln!("Update with: fresh --cmd update");
             } else {

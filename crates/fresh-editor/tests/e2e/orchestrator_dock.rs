@@ -125,6 +125,53 @@ fn ctrl_p_opens_palette_while_dock_focused_and_dock_stays() {
     h.assert_screen_contains("Orchestrator");
 }
 
+/// Opening the palette from the dock hands the keyboard back to the editor, so
+/// the palette is the *editor's* — commands that act on the focused buffer are
+/// offered and run.
+///
+/// This is the dock's answer to the rule that keeps buffer commands out of the
+/// palette while the file explorer or a terminal has focus: the dock never
+/// holds focus while the palette is open. Every route in blurs it first — the
+/// key path (an unhandled Ctrl/Alt chord on a left dock blurs and falls
+/// through) and the mouse path (a click outside the dock blurs it), so a
+/// menu-driven open is no different. If that ever changes, this test fails and
+/// the dock needs `Dock` on the focus-independent commands the way the explorer
+/// got `FileExplorer`.
+#[test]
+fn palette_opened_from_dock_serves_the_editor_buffer() {
+    let (_tmp, root) = setup_project("alphaproj");
+    let mut h =
+        EditorTestHarness::with_config_and_working_dir(120, 32, Default::default(), root.clone())
+            .unwrap();
+    h.render().unwrap();
+    open_dock(&mut h);
+
+    // Distinctive content in the editor buffer, so "the command ran" is
+    // something visible rather than the mere absence of a refusal.
+    h.send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    h.wait_for_prompt().unwrap();
+    h.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    h.render().unwrap();
+    h.type_text("UNIQUELINE").unwrap();
+    h.render().unwrap();
+
+    h.run_palette_command("Duplicate Line").unwrap();
+    h.render().unwrap();
+
+    let screen = h.screen_to_string();
+    assert!(
+        !screen.contains("not available in current context"),
+        "Ctrl+P blurs the dock, so the palette belongs to the editor and its \
+         buffer commands must run\nScreen:\n{screen}"
+    );
+    assert_eq!(
+        screen.matches("UNIQUELINE").count(),
+        2,
+        "Duplicate Line should have acted on the editor's buffer\nScreen:\n{screen}"
+    );
+}
+
 /// Alt+O toggles keyboard focus between the editor and the dock, and the
 /// shift is *visible*: the dock's right-edge divider lights with the accent
 /// colour while focused and dims when focus leaves. Drives only the keyboard

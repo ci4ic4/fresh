@@ -247,6 +247,51 @@ impl IndentationGuideMode {
     pub const OPTIONS: &'static [&'static str] = &["none", "all", "active"];
 }
 
+/// Inputs to [`resolve_indentation_guide_mode`], gathered from the global
+/// config and the buffer being rendered.
+#[derive(Debug, Clone, Copy)]
+pub struct IndentationGuideInputs {
+    /// The global `editor.indentation_guide` mode.
+    pub global: IndentationGuideMode,
+    /// Explicit per-buffer user override from "Toggle Indentation Guides
+    /// (Current Buffer)". Wins over everything below; persisted per file.
+    pub user_override: Option<bool>,
+    /// Explicit plugin override (`setIndentationGuide`). Never persisted.
+    pub plugin_override: Option<bool>,
+    /// The buffer's resolved language gate (`BufferSettings::indentation_guide`).
+    pub language_gate: bool,
+    /// Whether this is a virtual (non-file) buffer.
+    pub is_virtual_buffer: bool,
+}
+
+/// Resolve the indentation-guide mode that actually renders for a buffer.
+///
+/// THE single place the precedence chain lives, so the renderer and the
+/// per-buffer toggle command can never disagree about what is on screen:
+///
+/// 1. the per-buffer user override ("Toggle Indentation Guides (Current
+///    Buffer)") — an explicit `true` turns guides on even where the global
+///    setting is `none`, falling back to [`IndentationGuideMode::All`];
+/// 2. the plugin override (`setIndentationGuide`);
+/// 3. virtual buffers and language opt-outs (plain text) force guides off;
+/// 4. otherwise the global mode.
+pub fn resolve_indentation_guide_mode(inputs: IndentationGuideInputs) -> IndentationGuideMode {
+    match inputs.user_override {
+        Some(true) => match inputs.global {
+            IndentationGuideMode::None => IndentationGuideMode::All,
+            mode => mode,
+        },
+        Some(false) => IndentationGuideMode::None,
+        None => match inputs.plugin_override {
+            Some(true) => inputs.global,
+            Some(false) => IndentationGuideMode::None,
+            None if inputs.is_virtual_buffer => IndentationGuideMode::None,
+            None if !inputs.language_gate => IndentationGuideMode::None,
+            None => inputs.global,
+        },
+    }
+}
+
 impl JsonSchema for IndentationGuideMode {
     fn schema_name() -> Cow<'static, str> {
         Cow::Borrowed("IndentationGuideMode")
@@ -3158,35 +3203,35 @@ impl MenuConfig {
                         label: t!("menu.file.save").to_string(),
                         action: "save".to_string(),
                         args: HashMap::new(),
-                        when: Some(context_keys::HAS_BUFFER.to_string()),
+                        when: Some(context_keys::CAN_SAVE.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
                         label: t!("menu.file.save_as").to_string(),
                         action: "save_as".to_string(),
                         args: HashMap::new(),
-                        when: Some(context_keys::HAS_BUFFER.to_string()),
+                        when: Some(context_keys::HAS_TEXT_BUFFER.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
                         label: t!("menu.file.save_all").to_string(),
                         action: "save_all".to_string(),
                         args: HashMap::new(),
-                        when: Some(context_keys::HAS_BUFFER.to_string()),
+                        when: Some(context_keys::CAN_SAVE_ALL.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
                         label: t!("menu.file.revert").to_string(),
                         action: "revert".to_string(),
                         args: HashMap::new(),
-                        when: Some(context_keys::HAS_BUFFER.to_string()),
+                        when: Some(context_keys::CAN_REVERT.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
                         label: t!("menu.file.reload_with_encoding").to_string(),
                         action: "reload_with_encoding".to_string(),
                         args: HashMap::new(),
-                        when: Some(context_keys::HAS_BUFFER.to_string()),
+                        when: Some(context_keys::CAN_REVERT.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Separator { separator: true },
@@ -3232,14 +3277,14 @@ impl MenuConfig {
                         label: t!("menu.edit.undo").to_string(),
                         action: "undo".to_string(),
                         args: HashMap::new(),
-                        when: Some(context_keys::HAS_BUFFER.to_string()),
+                        when: Some(context_keys::CAN_EDIT.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
                         label: t!("menu.edit.redo").to_string(),
                         action: "redo".to_string(),
                         args: HashMap::new(),
-                        when: Some(context_keys::HAS_BUFFER.to_string()),
+                        when: Some(context_keys::CAN_EDIT.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Separator { separator: true },
@@ -3247,7 +3292,7 @@ impl MenuConfig {
                         label: t!("menu.edit.cut").to_string(),
                         action: "cut".to_string(),
                         args: HashMap::new(),
-                        when: Some(context_keys::CAN_COPY.to_string()),
+                        when: Some(context_keys::CAN_CUT.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
@@ -3309,14 +3354,14 @@ impl MenuConfig {
                         label: t!("menu.edit.replace").to_string(),
                         action: "replace".to_string(),
                         args: HashMap::new(),
-                        when: Some(context_keys::HAS_BUFFER.to_string()),
+                        when: Some(context_keys::CAN_EDIT.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
                         label: t!("menu.edit.query_replace").to_string(),
                         action: "query_replace".to_string(),
                         args: HashMap::new(),
-                        when: Some(context_keys::HAS_BUFFER.to_string()),
+                        when: Some(context_keys::CAN_EDIT.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Separator { separator: true },
@@ -3324,7 +3369,7 @@ impl MenuConfig {
                         label: t!("menu.edit.delete_line").to_string(),
                         action: "delete_line".to_string(),
                         args: HashMap::new(),
-                        when: Some(context_keys::HAS_BUFFER.to_string()),
+                        when: Some(context_keys::CAN_EDIT.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
@@ -3884,7 +3929,7 @@ impl MenuConfig {
                         label: t!("menu.explorer.cut").to_string(),
                         action: "cut".to_string(),
                         args: HashMap::new(),
-                        when: Some(context_keys::CAN_COPY.to_string()),
+                        when: Some(context_keys::CAN_CUT.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {

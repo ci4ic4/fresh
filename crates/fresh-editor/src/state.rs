@@ -98,6 +98,28 @@ pub struct BufferSettings {
     /// Set based on language config; can be toggled per-buffer by user
     pub use_tabs: bool,
 
+    /// Explicit per-buffer indentation-style override, set by "Toggle
+    /// Indentation: Spaces ↔ Tabs (Current Buffer)". `None` = follow the
+    /// resolved language config. Persisted in the per-file workspace state.
+    pub use_tabs_override: Option<bool>,
+
+    /// Explicit per-buffer whitespace-indicator master override, set by
+    /// "Toggle Whitespace Indicators (Current Buffer)" / "Toggle Tab
+    /// Indicators (Current Buffer)". `Some(false)` hides every indicator
+    /// regardless of config; `Some(true)` shows the configured set; `None`
+    /// follows config. Persisted in the per-file workspace state.
+    ///
+    /// A single bool rather than a full [`WhitespaceVisibility`](crate::config::WhitespaceVisibility):
+    /// the command is a master on/off, and storing the resolved struct would
+    /// freeze the buffer against later config edits.
+    pub whitespace_override: Option<bool>,
+    /// Explicit per-buffer override for the tab indicators alone (the `tabs_*`
+    /// trio of [`WhitespaceVisibility`](crate::config::WhitespaceVisibility)),
+    /// layered on top of `whitespace_override`: the master toggle answers "any
+    /// indicators at all?", this answers "tab arrows specifically?". `None` =
+    /// follow whatever the master/config resolution produced.
+    pub tab_indicators_override: Option<bool>,
+
     /// Tab size (number of spaces per tab character) for rendering.
     /// Used for visual display of tab characters and indent calculations.
     /// Set based on language config; can be changed per-buffer by user
@@ -131,6 +153,12 @@ pub struct BufferSettings {
     /// `languages.<id>.indentation_guide`). Set based on global + language
     /// config.
     pub indentation_guide: bool,
+
+    /// Explicit per-buffer occurrence-highlight override, set by "Toggle
+    /// Occurrence Highlight (Current Buffer)". `None` = follow the global
+    /// `editor.highlight_occurrences` setting. Persisted in the per-file
+    /// workspace state.
+    pub highlight_occurrences_override: Option<bool>,
 }
 
 impl Default for BufferSettings {
@@ -138,6 +166,9 @@ impl Default for BufferSettings {
         Self {
             whitespace: crate::config::WhitespaceVisibility::default(),
             use_tabs: false,
+            use_tabs_override: None,
+            whitespace_override: None,
+            tab_indicators_override: None,
             tab_size: 4,
             auto_close: true,
             auto_surround: true,
@@ -145,6 +176,7 @@ impl Default for BufferSettings {
             virtual_space_override: None,
             word_characters: String::new(),
             indentation_guide: true,
+            highlight_occurrences_override: None,
         }
     }
 }
@@ -159,18 +191,64 @@ impl BufferSettings {
     /// config reload) picks it up automatically.
     ///
     /// Explicit per-buffer user overrides are preserved: `virtual_space`
-    /// keeps following `virtual_space_override` when one is set.
+    /// keeps following `virtual_space_override`, `use_tabs` follows
+    /// `use_tabs_override` and `whitespace` follows `whitespace_override`
+    /// when one is set. (The indentation-guide and fold-indicator pins live
+    /// on `BufferViewState` — per split — and are consulted at render time,
+    /// so re-stamping the language gate below can't clear them.)
     pub fn apply_config(&mut self, resolved: &crate::config::BufferConfig) {
         self.tab_size = resolved.tab_size;
-        self.use_tabs = resolved.use_tabs;
+        self.use_tabs = self.use_tabs_override.unwrap_or(resolved.use_tabs);
         self.auto_close = resolved.auto_close;
         self.auto_surround = resolved.auto_surround;
         self.virtual_space = self
             .virtual_space_override
             .unwrap_or(resolved.virtual_space);
-        self.whitespace = resolved.whitespace;
+        self.apply_whitespace_override(resolved.whitespace);
         self.word_characters = resolved.word_characters.clone();
         self.indentation_guide = resolved.indentation_guide;
+    }
+
+    /// Drop every explicit per-buffer override, so the buffer goes back to
+    /// following the global + per-language configuration.
+    ///
+    /// The counterpart to [`apply_config`](Self::apply_config), which
+    /// deliberately *preserves* these: "Reset Buffer Settings" is the one place
+    /// that must clear them, and it re-applies the config afterwards. Every
+    /// `*_override` field belongs here — one left out is a setting the user can
+    /// pin but never un-pin.
+    pub fn clear_user_overrides(&mut self) {
+        self.virtual_space_override = None;
+        self.use_tabs_override = None;
+        self.whitespace_override = None;
+        self.tab_indicators_override = None;
+        self.highlight_occurrences_override = None;
+    }
+
+    /// Resolve `whitespace` from the buffer's configured visibility and the
+    /// per-buffer master override.
+    ///
+    /// THE single place the override semantics live, so a restored session and
+    /// a later `apply_config` can't disagree. `Some(true)` has to mirror what
+    /// `WhitespaceVisibility::toggle_all` does when nothing is configured
+    /// visible — fall back to the default set — otherwise turning indicators on
+    /// in a language that hides them (Go hides tabs) would silently restore to
+    /// "hidden" and lose the user's choice.
+    pub fn apply_whitespace_override(&mut self, configured: crate::config::WhitespaceVisibility) {
+        use crate::config::WhitespaceVisibility;
+        self.whitespace = match self.whitespace_override {
+            Some(false) => WhitespaceVisibility::hidden(),
+            Some(true) if !configured.any_visible() => WhitespaceVisibility::default(),
+            _ => configured,
+        };
+        // The tab pin layers on top of the master resolution, so "hide the
+        // arrows but keep the space dots" (and the reverse) survives both a
+        // config re-application and a session restore.
+        if let Some(tabs) = self.tab_indicators_override {
+            self.whitespace.tabs_leading = tabs;
+            self.whitespace.tabs_inner = tabs;
+            self.whitespace.tabs_trailing = tabs;
+        }
     }
 }
 
@@ -374,6 +452,20 @@ impl EditorState {
     pub fn apply_buffer_config(&mut self, config: &crate::config::Config) {
         let resolved = crate::config::BufferConfig::resolve(config, Some(&self.language));
         self.buffer_settings.apply_config(&resolved);
+    }
+
+    /// Point this buffer's occurrence highlighting at the editor-wide default,
+    /// unless the user pinned it with "Toggle Occurrence Highlight (Current
+    /// Buffer)".
+    ///
+    /// THE single place `reference_highlight_overlay.enabled` is derived from
+    /// config. Every file-open path stamps it, so a pin that only the toggle
+    /// knew about would be erased the next time the buffer was (re)opened.
+    pub fn apply_occurrence_highlight(&mut self, global_default: bool) {
+        self.reference_highlight_overlay.enabled = self
+            .buffer_settings
+            .highlight_occurrences_override
+            .unwrap_or(global_default);
     }
 
     /// Create a new state with a buffer and default (plain text) language.

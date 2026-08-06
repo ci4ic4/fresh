@@ -1241,28 +1241,33 @@ impl Editor {
             Action::UpdateFresh => {
                 // Once an update is running or finished, the indicator's job is
                 // to surface the update terminal, not to re-offer the update —
-                // except after a failure, where it offers retry / show-log /
-                // cancel.
-                if self.self_update_phase()
-                    == crate::services::release_checker::SelfUpdatePhase::Failed
-                {
-                    self.show_update_failed_popup();
-                } else if self.self_update_phase()
-                    != crate::services::release_checker::SelfUpdatePhase::Idle
-                {
-                    self.show_self_update_output();
-                } else if !self.config().self_update {
-                    self.set_status_message(t!("update.disabled").to_string());
-                } else if !self.is_update_available() {
-                    self.set_status_message(t!("update.up_to_date").to_string());
-                } else {
-                    // An update is available — offer it via the popup regardless
-                    // of install method. Choosing "Update" opens the local update
-                    // terminal (`fresh --cmd update --yes`); for unknown/source
-                    // installs that terminal just prints the releases page and
-                    // exits, but the UX stays consistent with every other state.
-                    let version = self.latest_version().unwrap_or("").to_string();
-                    self.show_update_popup(&version);
+                // except at the two terminal states that leave something for
+                // the user to act on.
+                use crate::services::release_checker::SelfUpdatePhase;
+                match self.self_update_phase() {
+                    // Failed: retry / show-log / cancel.
+                    SelfUpdatePhase::Failed => self.show_update_failed_popup(),
+                    // Action required: the update ran cleanly but left a command
+                    // to run. Surface *that*, rather than re-offering an update
+                    // that has already been downloaded and verified.
+                    SelfUpdatePhase::ActionRequired => self.show_update_action_required_popup(),
+                    SelfUpdatePhase::Running | SelfUpdatePhase::Succeeded => {
+                        self.show_self_update_output()
+                    }
+                    SelfUpdatePhase::Idle => {
+                        if !self.config().self_update {
+                            self.set_status_message(t!("update.disabled").to_string());
+                        } else if !self.is_update_available() {
+                            self.set_status_message(t!("update.up_to_date").to_string());
+                        } else {
+                            // An update is available — offer it through a popup
+                            // built from the resolved update plan, so the
+                            // confirmation says how this copy was installed and
+                            // what confirming will actually do.
+                            let version = self.latest_version().unwrap_or("").to_string();
+                            self.show_update_popup(&version);
+                        }
+                    }
                 }
             }
             Action::FormatBuffer => {
@@ -1588,6 +1593,13 @@ impl Editor {
 
                 // Update all viewports to reflect the new line wrap setting,
                 // respecting per-language overrides
+                let active_split = self
+                    .windows
+                    .get(&self.active_window)
+                    .and_then(|w| w.buffers.splits())
+                    .map(|(mgr, _)| mgr)
+                    .expect("active window must have a populated split layout")
+                    .active_split();
                 let leaf_ids: Vec<_> = self
                     .windows
                     .get(&self.active_window)
@@ -1614,14 +1626,28 @@ impl Editor {
                         .expect("active window must have a populated split layout")
                         .get_mut(&leaf_id)
                     {
-                        view_state.viewport.line_wrap_enabled = effective_wrap;
-                        view_state.viewport.wrap_indent = self.config.editor.wrap_indent;
-                        view_state.viewport.wrap_column = wrap_column;
-                        // Global toggle expresses global intent; drop the
-                        // per-buffer pin so it doesn't revert this change.
-                        view_state.line_wrap_override = None;
+                        // The active split's own pin is dropped — the user is
+                        // expressing a global intent on the view in front of
+                        // them. Every other pinned split keeps its choice: a
+                        // global default must not silently un-pin work the
+                        // user did elsewhere (same rule as the highlight
+                        // toggles below).
+                        if leaf_id == active_split {
+                            view_state.line_wrap_override = None;
+                        }
+                        if view_state.line_wrap_override.is_none() {
+                            view_state.viewport.line_wrap_enabled = effective_wrap;
+                            view_state.viewport.wrap_indent = self.config.editor.wrap_indent;
+                            view_state.viewport.wrap_column = wrap_column;
+                        }
                     }
                 }
+
+                // `editor.line_wrap` is an editor-wide default, so an
+                // unsuffixed toggle saves it to the user config layer — see the
+                // scope convention on `COMMANDS` in `input/commands.rs`. The
+                // per-buffer variant is "Toggle Line Wrap (Current Buffer)".
+                self.persist_config_change(crate::config_keys::EDITOR_LINE_WRAP, new_value);
 
                 let state = if self.config.editor.line_wrap {
                     t!("view.state_enabled").to_string()
@@ -1633,6 +1659,13 @@ impl Editor {
             Action::ToggleCurrentLineHighlight => {
                 let new_value = !self.config.editor.highlight_current_line;
                 self.config_mut().editor.highlight_current_line = new_value;
+                let active_split = self
+                    .windows
+                    .get(&self.active_window)
+                    .and_then(|w| w.buffers.splits())
+                    .map(|(mgr, _)| mgr)
+                    .expect("active window must have a populated split layout")
+                    .active_split();
 
                 // Update all splits
                 let leaf_ids: Vec<_> = self
@@ -1652,10 +1685,25 @@ impl Editor {
                         .expect("active window must have a populated split layout")
                         .get_mut(&leaf_id)
                     {
-                        view_state.highlight_current_line =
-                            self.config.editor.highlight_current_line;
+                        // The active split's own pin is dropped just below —
+                        // the user is expressing a global intent on the view in
+                        // front of them. Every other pinned buffer keeps its
+                        // choice; a global default must not silently un-pin
+                        // work the user did elsewhere.
+                        if leaf_id == active_split {
+                            view_state.highlight_current_line_override = None;
+                        }
+                        if view_state.highlight_current_line_override.is_none() {
+                            view_state.highlight_current_line =
+                                self.config.editor.highlight_current_line;
+                        }
                     }
                 }
+
+                self.persist_config_change(
+                    crate::config_keys::EDITOR_HIGHLIGHT_CURRENT_LINE,
+                    new_value,
+                );
 
                 let state = if self.config.editor.highlight_current_line {
                     t!("view.state_enabled").to_string()
@@ -1669,10 +1717,29 @@ impl Editor {
             Action::ToggleOccurrenceHighlight => {
                 let new_value = !self.config.editor.highlight_occurrences;
                 self.config_mut().editor.highlight_occurrences = new_value;
+                let active_buffer = self.active_buffer();
 
-                // Update all open buffers
+                // Update all open buffers. A buffer the user pinned with the
+                // "(Current Buffer)" variant keeps its choice — except the
+                // active one, whose pin is cleared first as a global intent.
+                if let Some(state) = self
+                    .windows
+                    .get_mut(&self.active_window)
+                    .map(|w| &mut w.buffers)
+                    .expect("active window present")
+                    .get_mut(&active_buffer)
+                {
+                    state.buffer_settings.highlight_occurrences_override = None;
+                }
                 for window in self.windows.values_mut() {
                     for (_, state) in &mut window.buffers {
+                        if state
+                            .buffer_settings
+                            .highlight_occurrences_override
+                            .is_some()
+                        {
+                            continue;
+                        }
                         state.reference_highlight_overlay.enabled = new_value;
                         if !new_value {
                             state
@@ -1681,6 +1748,11 @@ impl Editor {
                         }
                     }
                 }
+
+                self.persist_config_change(
+                    crate::config_keys::EDITOR_HIGHLIGHT_OCCURRENCES,
+                    new_value,
+                );
 
                 let state = if new_value {
                     t!("view.state_enabled").to_string()
@@ -1958,15 +2030,27 @@ impl Editor {
             Action::ToggleFileExplorer => self.toggle_file_explorer(),
             Action::ToggleFileExplorerSide => self.toggle_file_explorer_side(),
             Action::ToggleMenuBar => self.toggle_menu_bar(),
-            Action::ToggleTabBar => self.active_window_mut().toggle_tab_bar(),
-            Action::ToggleStatusBar => self.active_window_mut().toggle_status_bar(),
-            Action::TogglePromptLine => self.active_window_mut().toggle_prompt_line(),
+            Action::ToggleTabBar => self.toggle_tab_bar(),
+            Action::ToggleStatusBar => self.toggle_status_bar(),
+            Action::TogglePromptLine => self.toggle_prompt_line(),
             Action::ToggleVerticalScrollbar => self.toggle_vertical_scrollbar(),
             Action::ToggleHorizontalScrollbar => self.toggle_horizontal_scrollbar(),
             Action::ToggleLineNumbers => self.toggle_line_numbers(),
             Action::ToggleLineNumbersCurrentBuffer => self.toggle_line_numbers_current_buffer(),
             Action::ToggleLineWrapCurrentBuffer => self.toggle_line_wrap_current_buffer(),
             Action::ToggleVirtualSpaceCurrentBuffer => self.toggle_virtual_space_current_buffer(),
+            Action::ToggleIndentationGuideCurrentBuffer => {
+                self.toggle_indentation_guide_current_buffer()
+            }
+            Action::ToggleFoldIndicatorsCurrentBuffer => {
+                self.toggle_fold_indicators_current_buffer()
+            }
+            Action::ToggleCurrentLineHighlightCurrentBuffer => {
+                self.toggle_current_line_highlight_current_buffer()
+            }
+            Action::ToggleOccurrenceHighlightCurrentBuffer => {
+                self.toggle_occurrence_highlight_current_buffer()
+            }
             Action::TriggerWaveAnimation => self.trigger_wave_animation(),
             Action::ToggleScrollSync => self.active_window_mut().toggle_scroll_sync(),
             Action::ToggleMouseCapture => self.toggle_mouse_capture(),
@@ -2013,7 +2097,13 @@ impl Editor {
                     .expect("active window present")
                     .get_mut(&__buffer_id)
                 {
-                    state.buffer_settings.use_tabs = !state.buffer_settings.use_tabs;
+                    let new_value = !state.buffer_settings.use_tabs;
+                    state.buffer_settings.use_tabs = new_value;
+                    // Record the explicit override so a later `apply_config`
+                    // (config reload, Set Language, save-time detection) can't
+                    // re-stamp the language default over the user's choice —
+                    // and so it can be persisted per file.
+                    state.buffer_settings.use_tabs_override = Some(new_value);
                     let status = if state.buffer_settings.use_tabs {
                         "Indentation: Tabs"
                     } else {
@@ -2022,7 +2112,7 @@ impl Editor {
                     self.set_status_message(status.to_string());
                 }
             }
-            Action::ToggleTabIndicators | Action::ToggleWhitespaceIndicators => {
+            Action::ToggleWhitespaceIndicators => {
                 let __buffer_id = self.active_buffer();
                 // Resolve the buffer's configured visibility up front so turning
                 // the master toggle back on restores the indicators the user
@@ -2037,10 +2127,44 @@ impl Editor {
                     .get_mut(&__buffer_id)
                 {
                     state.buffer_settings.whitespace.toggle_all(restore);
-                    let status = if state.buffer_settings.whitespace.any_visible() {
+                    let visible = state.buffer_settings.whitespace.any_visible();
+                    state.buffer_settings.whitespace_override = Some(visible);
+                    // The master toggle answers "any indicators at all?", so
+                    // it subsumes a finer tab pin: "hide whitespace
+                    // indicators" hiding everything *except* pinned arrows
+                    // would make the master appear broken.
+                    state.buffer_settings.tab_indicators_override = None;
+                    let status = if visible {
                         t!("toggle.whitespace_indicators_shown")
                     } else {
                         t!("toggle.whitespace_indicators_hidden")
+                    };
+                    self.set_status_message(status.to_string());
+                }
+            }
+            Action::ToggleTabIndicators => {
+                let __buffer_id = self.active_buffer();
+                if let Some(state) = self
+                    .windows
+                    .get_mut(&self.active_window)
+                    .map(|w| &mut w.buffers)
+                    .expect("active window present")
+                    .get_mut(&__buffer_id)
+                {
+                    // Only the tab-arrow trio: the command's description has
+                    // always promised "tab arrow indicators (→)", but it used
+                    // to share the master toggle-all with Whitespace
+                    // Indicators and flipped the space dots too.
+                    let ws = &mut state.buffer_settings.whitespace;
+                    let new_value = !(ws.tabs_leading || ws.tabs_inner || ws.tabs_trailing);
+                    ws.tabs_leading = new_value;
+                    ws.tabs_inner = new_value;
+                    ws.tabs_trailing = new_value;
+                    state.buffer_settings.tab_indicators_override = Some(new_value);
+                    let status = if new_value {
+                        t!("toggle.tab_indicators_shown")
+                    } else {
+                        t!("toggle.tab_indicators_hidden")
                     };
                     self.set_status_message(status.to_string());
                 }

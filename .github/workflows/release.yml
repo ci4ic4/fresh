@@ -393,7 +393,7 @@ jobs:
                 self_update = false
 
                 [hints]
-                formula = "fresh-editor"
+                formula = "fresh"
                 tap = "sinelaw/homebrew-fresh"
               RECEIPT
             end
@@ -495,7 +495,9 @@ jobs:
             artifacts/*.zip \
             artifacts/*.zip.sha256 \
             artifacts/*.deb \
+            artifacts/*.deb.sha256 \
             artifacts/*.rpm \
+            artifacts/*.rpm.sha256 \
             artifacts/*.flatpak \
             artifacts/*.flatpak.sha256 \
             artifacts/*.AppImage \

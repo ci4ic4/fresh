@@ -653,7 +653,7 @@ impl Editor {
             #[cfg(feature = "plugins")]
             plugin_command_backlog: std::collections::VecDeque::new(),
             #[cfg(feature = "plugins")]
-            grep_project_cancel: None,
+            grep_project_cancel: std::collections::HashMap::new(),
             #[cfg(feature = "plugins")]
             diff_baselines: crate::app::diff_baselines::BaselineStore::default(),
             #[cfg(feature = "plugins")]
@@ -1219,7 +1219,9 @@ impl Editor {
             tracing::debug!("Update checking enabled, starting periodic checker");
             Some(
                 crate::services::release_checker::start_periodic_update_check(
-                    crate::services::release_checker::DEFAULT_RELEASES_URL,
+                    // Honours $FRESH_RELEASES_URL so the indicator and the
+                    // update it launches agree on where releases come from.
+                    &crate::services::release_checker::releases_url(),
                     time_source.clone(),
                     dir_context.data_dir.clone(),
                 ),

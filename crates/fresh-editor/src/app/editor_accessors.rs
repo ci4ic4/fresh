@@ -737,10 +737,6 @@ impl Editor {
         std::mem::replace(&mut self.active_window_mut().authority, placeholder)
     }
 
-    /// The editor's current working directory — the active window's
-    /// project root. Derived, not stored: there is no separate
-    /// `working_dir` field that could drift out of sync with the active
-    /// window (issue #2056). Individual buffers may live elsewhere.
     /// Run a blocking effect (filesystem writes/deletes, teardown I/O) off
     /// the editor thread. This is the escape hatch for the "mutation now,
     /// effect off-loop" decomposition: the caller snapshots whatever the
@@ -769,6 +765,10 @@ impl Editor {
         }
     }
 
+    /// The editor's current working directory — the active window's project
+    /// root. Derived, not stored: there is no separate `working_dir` field that
+    /// could drift out of sync with the active window (issue #2056).
+    /// Individual buffers may live elsewhere.
     pub fn working_dir(&self) -> &std::path::Path {
         &self.active_window().root
     }
@@ -1302,14 +1302,14 @@ impl Editor {
     }
 
     /// Move the update indicator to its terminal state when the update terminal
-    /// exits.
-    pub fn finish_self_update(&mut self, success: bool) {
+    /// exits. The child's exit code carries which of the three outcomes it was
+    /// — see [`SelfUpdatePhase::from_exit_code`].
+    ///
+    /// [`SelfUpdatePhase::from_exit_code`]:
+    ///     crate::services::release_checker::SelfUpdatePhase::from_exit_code
+    pub fn finish_self_update(&mut self, exit_code: Option<i32>) {
         use crate::services::release_checker::SelfUpdatePhase;
-        self.self_update_phase = if success {
-            SelfUpdatePhase::Succeeded
-        } else {
-            SelfUpdatePhase::Failed
-        };
+        self.self_update_phase = SelfUpdatePhase::from_exit_code(exit_code);
     }
 
     /// Switch to the update terminal buffer so the user can watch progress or

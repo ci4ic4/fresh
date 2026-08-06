@@ -330,6 +330,114 @@ fn test_file_explorer_focus_switching() {
     assert!(harness.editor().file_explorer_visible());
 }
 
+/// Run `command` from the palette and return the resulting screen.
+///
+/// `EditorTestHarness::run_palette_command` is what waits for the row to be
+/// listed before pressing Enter; this only adds the render + capture.
+fn run_from_palette(harness: &mut EditorTestHarness, command: &str) -> String {
+    harness.run_palette_command(command).unwrap();
+    harness.render().unwrap();
+    harness.screen_to_string()
+}
+
+/// Commands that don't need a focused buffer still run from the palette while
+/// the file explorer holds the keyboard. Before this, the explorer disabled
+/// every `Normal`-context command, so Enter produced "not available in current
+/// context" for editor-wide ones too.
+#[test]
+fn test_palette_runs_focus_independent_command_while_explorer_focused() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    let _ = harness.editor_mut().process_async_messages();
+    harness.render().unwrap();
+    assert!(harness.editor().file_explorer_visible());
+
+    // Editor-wide: the global view toggles don't care what has focus, and the
+    // status line reports the new state — proof it ran.
+    let screen = run_from_palette(&mut harness, "Toggle Line Wrap");
+    assert!(
+        !screen.contains("not available in current context"),
+        "the palette refused an editor-wide toggle in the explorer\nScreen:\n{screen}"
+    );
+    assert!(
+        screen.contains("Line wrap"),
+        "Toggle Line Wrap should have run and reported the new state\nScreen:\n{screen}"
+    );
+
+    // And a command whose keybinding already falls through to the explorer
+    // (`is_terminal_ui_action`) is no longer greyed out in the palette either.
+    let screen = run_from_palette(&mut harness, "Toggle Utility Dock");
+    assert!(
+        screen.contains("No Utility Dock open"),
+        "Toggle Utility Dock should have run and reported no dock\nScreen:\n{screen}"
+    );
+}
+
+/// Saving is the keymap's application-wide exception — Ctrl+S already saves
+/// from the explorer — so the palette offers it there too, and it lands on the
+/// buffer that had focus before the tree took it.
+#[test]
+fn test_palette_saves_last_focused_buffer_from_explorer() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    let project_root = harness.project_dir().unwrap();
+    let file = project_root.join("saveme.txt");
+    fs::write(&file, "before\n").unwrap();
+
+    harness.open_file(&file).unwrap();
+    harness.type_text("EDITED").unwrap();
+    harness.render().unwrap();
+    // The tab carries the modified marker while the edit is unsaved.
+    harness.assert_screen_contains("saveme.txt*");
+
+    harness.editor_mut().focus_file_explorer();
+    let _ = harness.editor_mut().process_async_messages();
+    harness.render().unwrap();
+
+    let screen = run_from_palette(&mut harness, "Save File");
+    assert!(
+        !screen.contains("not available in current context"),
+        "Save File must not be refused in the explorer — Ctrl+S works there\nScreen:\n{screen}"
+    );
+
+    // The marker clears: the save reached the buffer that had focus before the
+    // tree did, not the tree's selection.
+    harness
+        .wait_until(|h| !h.screen_to_string().contains("saveme.txt*"))
+        .expect("the modified marker should clear once the buffer is saved");
+    assert!(
+        fs::read_to_string(&file).unwrap().contains("EDITED"),
+        "the edit should have reached disk"
+    );
+}
+
+/// The other half of the rule: the explorer owns the keyboard, so commands that
+/// act on the focused buffer's cursor are *not* offered through it.
+#[test]
+fn test_palette_refuses_buffer_command_while_explorer_focused() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+
+    // Typed before focusing the tree — the explorer swallows typing.
+    harness.type_text("UNIQUELINE").unwrap();
+    harness.render().unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    let _ = harness.editor_mut().process_async_messages();
+    harness.render().unwrap();
+
+    let screen = run_from_palette(&mut harness, "Duplicate Line");
+
+    assert!(
+        screen.contains("not available in current context"),
+        "Duplicate Line needs the buffer's cursor and should be refused from the explorer\nScreen:\n{screen}"
+    );
+    assert_eq!(
+        screen.matches("UNIQUELINE").count(),
+        1,
+        "the line must not have been duplicated\nScreen:\n{screen}"
+    );
+}
+
 /// Test that file explorer keybindings only work when explorer has focus
 #[test]
 fn test_file_explorer_context_aware_keybindings() {

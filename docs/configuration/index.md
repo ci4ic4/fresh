@@ -57,6 +57,23 @@ Settings are loaded from multiple layers, with higher layers overriding lower on
 - On Windows, User config is at `%APPDATA%\fresh\config.json`
 - Project config is found by searching up from the current directory for `.fresh/config.json`
 
+### Per-Buffer Overrides
+
+Below the config layers sits one more scope: an individual buffer. Command-palette toggles say which scope they act on, so you never have to guess:
+
+| Command form | Scope | Where it is saved |
+|---|---|---|
+| **Toggle X** | Editor-wide default | User config layer (`config.json`) |
+| **Toggle X (Current Buffer)** | The active buffer only | Per-file workspace state |
+
+An unsuffixed toggle changes the default and writes it to your user config immediately, the same as changing it in the Settings UI. It applies to every buffer that hasn't been pinned; the buffer you run it in adopts the new default (its own pin is cleared — you just expressed a global intent on it), while every *other* pinned buffer keeps its choice. A `(Current Buffer)` toggle pins just that file and leaves the default and every other buffer alone. Pins live in your session: they survive a restart for files the session restores, but closing a file's tab drops its pins.
+
+The write lands in the most specific config layer that already defines the setting: if a project config (`.fresh/config.json`) sets the key, the toggle updates the project file — so the change stays in effect in that project — and otherwise it updates your user config. If a write fails, the toggle still applies for the session and the status-bar warning indicator lights up with the reason in the warning log.
+
+Commands with the `(Current Buffer)` suffix: Line Numbers, Line Wrap, Virtual Space, Indentation Guides, Folding Indicators, Whitespace Indicators, Tab Indicators, Indentation (Spaces ↔ Tabs), Current Line Highlight, Occurrence Highlight, Read-Only Mode, and Auto-Revert. **Toggle LSP for Current Buffer** says it in prose instead, so that it stays easy to find in the palette for languages with no server configured. Auto-Revert and LSP apply for the current session only — they control file watching and language-server lifecycle rather than display.
+
+Some settings also have a per-language layer in the config file (`languages.<id>.<setting>`), which sits between the editor-wide default and a per-buffer pin.
+
 ## How Layers Are Merged
 
 Fresh merges all layers. Merge behavior depends on the setting type:

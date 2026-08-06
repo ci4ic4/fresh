@@ -449,26 +449,40 @@ pub(crate) fn render_content(
             };
 
             // Indentation guides are a source-code editing aid, like the column
-            // rulers above. Resolve the effective mode per buffer: an explicit
-            // plugin override (`setIndentationGuide`) wins; otherwise virtual
-            // buffers (grep results, *Diagnostics*, the Git Log commit list, …)
-            // default off because they aren't code, while ordinary file buffers
-            // follow the buffer's resolved `indentation_guide` gate (plain text
-            // defaults off; any language can opt out — see
-            // `BufferSettings::apply_config`) and then the global setting.
-            // A file-backed tool view the virtual default can't catch — the Git
-            // Log commit-detail diff — opts out via the override. This is
-            // independent of the line-number gutter, so an ordinary buffer
-            // keeps its guides with line numbers turned off.
+            // rulers above. Resolve the effective mode per buffer: the user's
+            // per-buffer toggle wins, then an explicit plugin override
+            // (`setIndentationGuide`); otherwise virtual buffers (grep results,
+            // *Diagnostics*, the Git Log commit list, …) default off because
+            // they aren't code, while ordinary file buffers follow the buffer's
+            // resolved `indentation_guide` gate (plain text defaults off; any
+            // language can opt out — see `BufferSettings::apply_config`) and
+            // then the global setting. A file-backed tool view the virtual
+            // default can't catch — the Git Log commit-detail diff — opts out
+            // via the plugin override. This is independent of the line-number
+            // gutter, so an ordinary buffer keeps its guides with line numbers
+            // turned off.
             let mut style = style;
-            style.cfg.indentation_guide = match state.indentation_guide_override {
-                Some(true) => style.cfg.indentation_guide,
-                Some(false) => IndentationGuideMode::None,
-                None if is_virtual_buffer => IndentationGuideMode::None,
-                None if !state.buffer_settings.indentation_guide => IndentationGuideMode::None,
-                None => style.cfg.indentation_guide,
-            };
+            style.cfg.indentation_guide = crate::config::resolve_indentation_guide_mode(
+                crate::config::IndentationGuideInputs {
+                    global: style.cfg.indentation_guide,
+                    // The user pin is per (split, buffer) on the view state,
+                    // so the same buffer in another split keeps its own guides.
+                    user_override: split_view_states
+                        .as_deref()
+                        .and_then(|vs| vs.get(&split_id))
+                        .and_then(|vs| vs.indentation_guide_user_override),
+                    plugin_override: state.indentation_guide_override,
+                    language_gate: state.buffer_settings.indentation_guide,
+                    is_virtual_buffer,
+                },
+            );
 
+            // Per-(split, buffer) pin, read before the mutable folds borrow.
+            let fold_indicators_visible = split_view_states
+                .as_deref()
+                .and_then(|vs| vs.get(&split_id))
+                .map(|vs| vs.fold_indicators_visible())
+                .unwrap_or(true);
             let mut empty_folds = FoldManager::new();
             let folds = split_view_states
                 .as_deref_mut()
@@ -516,6 +530,7 @@ pub(crate) fn render_content(
                 effective_rulers,
                 view_prefs.show_line_numbers,
                 effective_highlight_current_line,
+                fold_indicators_visible,
                 split_show_tilde,
                 highlight_current_column && state.show_cursors,
                 cell_theme_map,
@@ -1231,6 +1246,10 @@ pub(crate) fn compute_content_layout(
         let effective_highlight_current_line =
             view_prefs.highlight_current_line && state.show_cursors;
 
+        let fold_indicators_visible = split_view_states
+            .get(&split_id)
+            .map(|vs| vs.fold_indicators_visible())
+            .unwrap_or(true);
         let mut empty_folds = FoldManager::new();
         let folds = split_view_states
             .get_mut(&split_id)
@@ -1256,6 +1275,7 @@ pub(crate) fn compute_content_layout(
             software_cursor_only,
             view_prefs.show_line_numbers,
             effective_highlight_current_line,
+            fold_indicators_visible,
             diagnostics_inline_text,
             show_tilde,
             IndentationGuideMode::None,

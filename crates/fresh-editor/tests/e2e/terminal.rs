@@ -338,6 +338,129 @@ fn test_open_terminal_below_via_palette() {
     );
 }
 
+/// Run `command` from the palette and return the resulting screen.
+///
+/// Ctrl+P reaches the palette even while a terminal owns the keyboard, so this
+/// is the flow a user actually has from inside a shell.
+/// `EditorTestHarness::run_palette_command` is what waits for the row to be
+/// listed before pressing Enter; this only adds the render + capture.
+fn run_from_palette(harness: &mut EditorTestHarness, command: &str) -> String {
+    harness.run_palette_command(command).unwrap();
+    harness.render().unwrap();
+    harness.screen_to_string()
+}
+
+/// A command that doesn't need a text cursor still runs from the palette while
+/// a terminal is focused. "Toggle Utility Dock" already bypasses the terminal
+/// through its `Alt+\`` sibling keybinding, so the palette refusing it was pure
+/// inconsistency: the entry was greyed out and Enter only produced "not
+/// available in current context".
+#[test]
+fn test_palette_runs_ui_command_while_terminal_focused() {
+    let mut harness = harness_or_return!(120, 24);
+
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+    harness.assert_screen_contains("*Terminal 0*");
+
+    let screen = run_from_palette(&mut harness, "Toggle Utility Dock");
+
+    assert!(
+        !screen.contains("not available in current context"),
+        "the palette refused a focus-independent command in a terminal\nScreen:\n{screen}"
+    );
+    // No dock exists yet, so the command reports that — proof it ran.
+    assert!(
+        screen.contains("No Utility Dock open"),
+        "Toggle Utility Dock should have run and reported no dock\nScreen:\n{screen}"
+    );
+}
+
+/// Same for an editor-wide command declared in the `Normal` context: the
+/// global view toggles apply to the editor, not to whichever buffer has focus.
+#[test]
+fn test_palette_runs_editor_wide_toggle_while_terminal_focused() {
+    let mut harness = harness_or_return!(120, 24);
+
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+    harness.assert_screen_contains("*Terminal 0*");
+
+    let screen = run_from_palette(&mut harness, "Toggle Line Wrap");
+
+    assert!(
+        !screen.contains("not available in current context"),
+        "the palette refused an editor-wide toggle in a terminal\nScreen:\n{screen}"
+    );
+    // The toggle reports the new global state — proof it ran.
+    assert!(
+        screen.contains("Line wrap"),
+        "Toggle Line Wrap should have run and reported the new state\nScreen:\n{screen}"
+    );
+}
+
+/// Column/row of `label` inside the open File menu, and the fg colour the
+/// renderer gave it.
+fn menu_item_fg(
+    harness: &EditorTestHarness,
+    label: &str,
+) -> (u16, u16, Option<ratatui::style::Color>) {
+    let (col, row) = harness
+        .find_text_on_screen(label)
+        .unwrap_or_else(|| panic!("menu should list '{label}'\n{}", harness.screen_to_string()));
+    let fg = harness.get_cell_style(col, row).and_then(|s| s.fg);
+    (col, row, fg)
+}
+
+/// File → Save is not offered while a terminal is focused.
+///
+/// A terminal is a real buffer, so it satisfied the menu's `has_buffer`
+/// condition and Save ran on it: the terminal's own scrollback transcript was
+/// written back over its backing file, reporting "Saved" — and once the
+/// terminal had appended to that file since the last sync, a "File changed on
+/// disk. (o)verwrite, (C)ancel?" prompt for a file the user never edited.
+#[test]
+fn test_file_menu_disables_save_for_a_terminal_buffer() {
+    let mut harness = harness_or_return!(120, 30);
+
+    // Baseline: an ordinary buffer with unsaved changes — Save renders like
+    // New File, i.e. enabled.
+    harness.type_text("EDITED").unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::F(10), KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    let (_, _, enabled_fg) = menu_item_fg(&harness, "New File");
+    let (_, _, save_fg) = menu_item_fg(&harness, "Save");
+    assert_eq!(
+        save_fg,
+        enabled_fg,
+        "Save should be enabled for a modified text buffer\n{}",
+        harness.screen_to_string()
+    );
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+    harness.assert_screen_contains("*Terminal 0*");
+
+    harness
+        .send_key(KeyCode::F(10), KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    let (_, _, enabled_fg) = menu_item_fg(&harness, "New File");
+    let (_, _, save_fg) = menu_item_fg(&harness, "Save");
+    assert_ne!(
+        save_fg,
+        enabled_fg,
+        "Save must be greyed out for a terminal buffer — it has no file of the \
+         user's to write\n{}",
+        harness.screen_to_string()
+    );
+}
+
 /// Test closing a terminal
 #[test]
 fn test_close_terminal() {
@@ -566,31 +689,35 @@ fn test_terminal_tab_title_follows_foreground_process() {
     harness.editor_mut().open_terminal();
     harness.render().unwrap();
 
-    let buffer_id = harness.editor().active_buffer_id();
-    let terminal_id = harness
-        .editor()
-        .active_window()
-        .get_terminal_id(buffer_id)
-        .expect("active buffer should be a terminal");
+    // What the tab must end up showing: the pty's foreground command, which
+    // right after open is the shell the terminal was spawned with. Derived
+    // from the same `detect_shell()` the spawn used, so this is a value the
+    // test knows independently — the old version read it back out of
+    // `terminal_manager()`, which made the assertion partly self-fulfilling
+    // and inspected model state besides (CONTRIBUTING.md Testing §2).
+    //
+    // `/proc/<pgid>/comm` carries the executable name, so compare against the
+    // shell path's file name.
+    let shell = fresh::services::terminal::detect_shell();
+    let expected = std::path::Path::new(&shell)
+        .file_name()
+        .expect("shell path has a file name")
+        .to_string_lossy()
+        .to_string();
 
-    // Semantic wait: the shell becomes the pty's foreground process group
-    // shortly after spawn. Drive renders until auto-naming resolves; the
-    // bound only guards against a hang (cargo nextest times out externally).
-    let mut expected = None;
-    for _ in 0..2000 {
-        if let Some(name) = harness
-            .editor()
-            .terminal_manager()
-            .get(terminal_id)
-            .and_then(|h| h.foreground_process_name())
-        {
-            expected = Some(name);
-            harness.render().unwrap();
-            break;
-        }
-        harness.render().unwrap();
-    }
-    let expected = expected.expect("foreground process name should resolve on Linux");
+    // Semantic wait, on rendered output: the shell becomes the pty's
+    // foreground process group shortly after spawn, and auto-naming repaints
+    // the tab when it does.
+    //
+    // This replaces a `for _ in 0..2000` loop with no sleep in it — a bound
+    // that could elapse in well under a second of spin and then panic on
+    // `expect`, i.e. a timeout inside a test (CONTRIBUTING.md Testing §3)
+    // sized in iterations rather than in anything the shell's startup relates
+    // to. `wait_until` waits indefinitely and paces itself, so a slow runner
+    // makes this slower, not red.
+    harness
+        .wait_until(|h| h.get_tab_bar().contains(&expected))
+        .unwrap();
 
     // The tab bar (row 1) now shows the foreground command, not the default.
     let tab_bar = harness.get_tab_bar();

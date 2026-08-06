@@ -1455,7 +1455,6 @@ dependencies = [
  "fresh-input-parser",
  "fresh-languages",
  "fresh-parser-js",
- "fresh-plugin-api-macros",
  "fresh-plugin-runtime",
  "fresh-update",
  "fresh-winterm",
@@ -1486,7 +1485,6 @@ dependencies = [
  "sha1",
  "sha2",
  "syntect",
- "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tiny_http",
@@ -1502,8 +1500,6 @@ dependencies = [
  "which",
  "windows-sys 0.61.2",
  "winresource",
- "xz2",
- "zip",
 ]
 
 [[package]]
@@ -1600,11 +1596,18 @@ dependencies = [
 name = "fresh-update"
 version = "0.4.6"
 dependencies = [
+ "libc",
  "serde",
+ "serde_json",
  "sha2",
+ "tar",
  "tempfile",
+ "tiny_http",
  "toml 0.8.23",
  "tracing",
+ "ureq",
+ "xz2",
+ "zip",
 ]
 
 [[package]]

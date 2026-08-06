@@ -1467,34 +1467,62 @@ impl Editor {
     /// this router adds only the cross-cutting effects that require
     /// editor-level state (the plugin hook + status message).
     /// Launch an interactive self-update in a **local** terminal buffer and
-    /// point the status-bar indicator at it. The terminal runs
-    /// `fresh --cmd update --yes` as a local PTY child — never through the
-    /// window's authority — so package-manager / sudo prompts work interactively
-    /// and the binary that gets swapped is the one actually running. Completion
-    /// is reported via `TerminalExited` (see `handle`/`finish_self_update`),
-    /// which moves the indicator to its `Succeeded`/`Failed` state.
+    /// point the status-bar indicator at it. See [`start_self_update_with`].
+    ///
+    /// [`start_self_update_with`]: Self::start_self_update_with
     pub fn start_self_update(&mut self) {
+        self.start_self_update_with(None);
+    }
+
+    /// Run the update in "download only" mode: fetch and verify the release
+    /// package, then stop and print the install command against the file on
+    /// disk. The middle rung — the network half is done, the root half is the
+    /// user's.
+    pub fn start_self_update_download_only(&mut self) {
+        self.start_self_update_with(Some("--download-only"));
+    }
+
+    /// Run the update in "show me the command" mode: nothing is fetched and
+    /// nothing is written: it names the commands and stops, for a user who
+    /// wants to read before anything happens.
+    pub fn start_self_update_print_command(&mut self) {
+        self.start_self_update_with(Some("--print-command"));
+    }
+
+    /// Launch `fresh --cmd update --yes` (plus `--print-command` when
+    /// `print_command`) as a local PTY child — never through the window's
+    /// authority — so the binary that gets updated is the one actually running.
+    ///
+    /// The PTY is what makes a one-step update possible: `sudo` can prompt for a
+    /// password right in this buffer, so a `.deb`/`.rpm` install finishes here
+    /// rather than being handed back to the user as a chore. Completion is
+    /// reported via `TerminalExited` (see `handle`/`finish_self_update`), which
+    /// moves the indicator to its `Succeeded`/`ActionRequired`/`Failed` state.
+    pub fn start_self_update_with(&mut self, mode_flag: Option<&str>) {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("cannot find current exe for self-update: {e}");
-                self.finish_self_update(false);
+                self.finish_self_update(None);
                 return;
             }
         };
-        let argv = vec![
+        let mut argv = vec![
             exe.to_string_lossy().into_owned(),
             "--cmd".to_string(),
             "update".to_string(),
             "--yes".to_string(),
         ];
+        if let Some(flag) = mode_flag {
+            argv.push(flag.to_string());
+        }
         let title = t!("update.terminal_title").to_string();
         let window = self.active_window;
         let Some((terminal_id, buffer_id)) = self
             .active_window_mut()
             .open_local_command_terminal(argv, title)
         else {
-            self.finish_self_update(false);
+            self.finish_self_update(None);
             return;
         };
         self.begin_self_update(terminal_id, window, buffer_id);

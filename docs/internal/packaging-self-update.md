@@ -129,7 +129,7 @@ per-target prebuilt archives and then feeds every downstream channel:
 | 6 | AUR `fresh-editor` (source) | `aur` | source build | AUR helper |
 | 7 | Debian/Ubuntu `.deb` | `apt` | dpkg | apt/dpkg |
 | 8 | Fedora/RHEL `.rpm` | `dnf` | rpm | dnf/rpm |
-| 9 | openSUSE (zypper) | `zypper` | rpm | zypper |
+| 9 | openSUSE | `zypper` | the `.rpm`, installed by hand | *(no repo — see §6)* |
 | 10 | Flatpak `io.github.sinelaw.fresh` | `flatpak` | flatpak bundle | flatpak |
 | 11 | AppImage (`install.sh` / direct) | `appimage` | extracted to `~/.local` | **fresh (self)** |
 | 12 | winget `sinelaw.fresh-editor` | `winget` | `.zip` | winget |
@@ -179,13 +179,28 @@ performed the install. Two flavours, both authoritative:
 Search order for the receipt (first hit wins):
 
 ```
-1. <dir(exe)>/install-receipt.toml                       # sidecar, same dir
-2. <dir(exe)>/../share/fresh/install-receipt.toml        # FHS-style sidecar
-3. <dir(exe)>/../lib/fresh/install-receipt.toml          # npm/node layout
-4. $XDG_DATA_HOME/fresh/install-receipt.toml   (Linux)   # per-user fallback
-   ~/Library/Application Support/fresh/…       (macOS)
-   %LOCALAPPDATA%\fresh\…                       (Windows)
+1. <dir(exe)>/install-receipt.toml                        # sidecar, same dir
+2. <dir(exe)>/../share/fresh/install-receipt.toml         # FHS, binary name
+3. <dir(exe)>/../share/fresh-editor/install-receipt.toml  # FHS, package name
+4. <dir(exe)>/../lib/fresh/install-receipt.toml           # npm/node layout
+5. $XDG_DATA_HOME/fresh/install-receipt.toml    (Linux)   # per-user fallback
+   ~/Library/Application Support/fresh/…        (macOS)
+   %LOCALAPPDATA%\fresh\…                        (Windows)
 ```
+
+Candidates 2 and 3 differ only in directory name, and both are required
+because the binary and the package are not named the same thing. The binary is
+`fresh`; the package is `fresh-editor`. OS packages put their data under
+`/usr/share/<package>`, so `.deb` (`debian/rules`) and `.rpm`
+(`[package.metadata.generate-rpm]`) ship `/usr/share/fresh-editor/`, while the
+wrapper channels that install under a prefix they control — the Homebrew
+formula, the Flatpak manifest, the Nix derivation — use `share/fresh/`.
+
+Both spellings are already installed on real machines, so the resolver searches
+both rather than picking a winner: renaming either side would strand every copy
+installed before the change. Note this is a *search* path, not a write path —
+installers must keep writing the one location their packaging convention
+dictates, and never both.
 
 Confidence = `Authoritative`.
 
@@ -252,8 +267,22 @@ install_root = "/home/u/.local/share/fresh-editor"  # appimage/tarball: where to
 ```
 
 `managed` and `self_update` are the two decision bits. Everything else is
-either provenance (`channel`, `version`, `installed_at`) or an optimisation so
-the update path doesn't have to re-derive it.
+either provenance (`channel`, `version`, `installed_at`) or a fact the update
+path would otherwise have to re-derive.
+
+That last category is not an optimisation — it is the point. Anything the
+*installer* knows for certain and the *running binary* could only infer belongs
+in `[hints]`. `pkg_arch` is the clearest case: the `.deb` build knows it
+produced `amd64`, while the running binary would have to map its own target
+triple through a per-tool arch-spelling table and hope the two agree. The deb
+and rpm pipelines record `target` and `pkg_arch` for exactly this reason, and
+`registry::package_asset_with` prefers the recorded value outright.
+
+The exception is anything that is a property of the *machine* rather than the
+install, and can change after it: which AUR helper is on `PATH`, whether `sudo`
+exists. Those are detected at runtime (`release_checker::fill_runtime_hints`)
+and must not be baked into a receipt, or the receipt goes stale the first time
+the user switches helper.
 
 ---
 
@@ -270,30 +299,89 @@ pub enum UpdateStrategy {
     SelfContained,
     /// User-scoped toolchain manager (cargo/npm/mise): delegate, no sudo.
     Toolchain { command: &'static [&'static str] },
+    /// A package manager owns the files but no repository serves them: fetch
+    /// the release artifact and hand it to the local package tool.
+    DownloadPackage,
     /// Unknown provenance: link to the releases page only.
     Manual,
 }
 ```
 
+`DownloadPackage` exists because a channel being *packaged* does not mean it is
+*hosted*. We publish the `.deb`, `.rpm` and `.flatpak` as GitHub release
+artifacts; there is no apt repo, no dnf repo and no Flathub remote, so
+`apt-get install --only-upgrade` / `flatpak update` have nothing to upgrade
+from and report "already up to date" forever. These channels download the new
+artifact from the release, verify it against its `.sha256` sidecar, and install
+it with `dpkg`/`rpm`/`flatpak`. An in-place binary swap is never an option for
+them: it would leave the package database describing a file we replaced behind
+its back. When the install needs root we print the command instead of running
+it, and report `ActionRequired` so the editor's indicator doesn't claim an
+update that hasn't landed yet (see the three-phase table in §15).
+
+Two invariants govern this table.
+
+**Never dead-end at the releases page.** A user who installed through one of our
+channels must be able to keep updating through it. Telling them to go and
+download a file by hand is the exact failure this mechanism exists to remove, so
+every channel anything can resolve to names a route to the next version.
+`registry.rs`'s `every_reachable_channel_has_a_same_channel_continuation` holds
+this: only `unknown` — the honest "we have no idea" — is exempt. That is why
+`zypper` and `pacman` are not `Manual` despite having no repository: an openSUSE
+user installed the release `.rpm`, so the next one arrives the same way, and an
+Arch user came via the AUR, so that is where they go back to. Only snap, scoop
+and chocolatey remain `Manual`, and only because we publish nothing they could
+install *and* nothing writes their receipts — they are unreachable, not
+dead-ended.
+
+**One mechanism per provenance class.** A proved provenance must imply exactly
+one way to update — no alternates chosen at runtime from what happens to be on
+the machine. Every such fallback was removed: the AUR helper chain (above),
+`sudo`/`doas`/run-unprivileged for privileged installs (now `sudo`, full stop),
+and the recorded-asset-name-else-look-it-up branches in the download paths (now
+the release feed for packages, the compiled-in target triple for archives). The
+`aur_helper` and `asset` hints survive in the receipt for wire compatibility but
+are no longer read.
+
+The cost is deliberate: a system with no `sudo` at all — a minimal container
+running as root — now fails with `failed to run sudo` instead of quietly
+installing by a different route. That is the intended trade. A fallback that
+succeeds by doing something other than what the provenance says is precisely the
+guessing this design exists to remove, and when it does fail it fails in a way
+that looks like a packaging bug rather than a missing `sudo`.
+
+**Never name a tool the channel doesn't guarantee.** For most channels the tool
+*is* the channel: a `homebrew` receipt means `brew` exists, an `npm` receipt
+means `npm` does. The AUR is the exception — it implies `pacman` and `makepkg`,
+not any particular helper — and the registry used to default to `yay`, naming a
+binary that is simply absent on the many Arch systems that build with plain
+`makepkg`, with the failure arriving only after the user had confirmed. The
+helper is now **detected** at runtime (`release_checker::fill_runtime_hints`,
+mirroring `install.sh`'s list and order) and recorded in `hints.aur_helper`;
+with none found, `registry::aur_command` falls back to the route that works
+everywhere: clone the AUR repo and `makepkg --syncdeps --install`. Detection
+happens before the plan is built, so the command shown in the popup is the one
+that runs.
+
 | channel | strategy | update invocation (templated with `hints`) |
 |---|---|---|
 | `homebrew` | Delegated | `brew upgrade {formula}` |
-| `apt` | Delegated (sudo) | `apt-get install --only-upgrade {package_name}` |
-| `dnf` | Delegated (sudo) | `dnf upgrade {package_name}` |
-| `zypper` | Delegated (sudo) | `zypper update {package_name}` |
-| `aur-bin` / `aur` | Delegated | `{aur_helper} -S {aur_pkg}` (detect yay/paru) |
-| `pacman` | Delegated (sudo) | `pacman -Syu {package_name}` |
+| `apt` | DownloadPackage (root) | fetch `.deb` from the release, verify, `dpkg -i` |
+| `dnf` | DownloadPackage (root) | fetch `.rpm` from the release, verify, `rpm -U` |
+| `zypper` | DownloadPackage (root) | fetch `.rpm` from the release, verify, `zypper install` |
+| `aur-bin` / `aur` | Delegated | `git clone` + `makepkg --syncdeps --install` |
+| `pacman` | Delegated | AUR: `git clone` + `makepkg --syncdeps --install` |
 | `winget` | Delegated | `winget upgrade --id {winget_id}` |
-| `scoop` | Delegated | `scoop update fresh` |
-| `chocolatey` | Delegated (admin) | `choco upgrade fresh` |
-| `flatpak` | Delegated | `flatpak update {flatpak_ref}` |
-| `snap` | Delegated | `snap refresh fresh` |
-| `nix` | Delegated | `nix profile upgrade` (or flake rebuild note) |
-| `freebsd-pkg` | Delegated (sudo) | `pkg upgrade fresh` |
+| `scoop` | **Manual** | unreachable: no scoop manifest, nothing writes this receipt |
+| `chocolatey` | **Manual** | unreachable: no package, nothing writes this receipt |
+| `flatpak` | DownloadPackage | fetch `.flatpak` bundle, verify, `flatpak install --user` |
+| `snap` | **Manual** | unreachable: no snap published, nothing writes this receipt |
+| `nix` | Delegated | `nix profile upgrade fresh` (matches `flake.nix`'s `pname`) |
+| `freebsd-pkg` | Delegated (root) | `pkg upgrade fresh` |
 | `cargo` | Toolchain | `cargo install --locked fresh-editor` |
 | `cargo-binstall` | Toolchain | `cargo binstall fresh-editor` |
 | `npm` | Toolchain | `npm update -g {npm_pkg}` |
-| `mise` | Toolchain | `mise upgrade fresh` |
+| `mise` | Toolchain | `mise upgrade github:sinelaw/fresh` (the tool ref, not `fresh`) |
 | `appimage` | SelfContained | fetch `.AppImage`, verify, replace file |
 | `tarball` | SelfContained | fetch archive, verify, atomic binary swap |
 | `source` | Manual | `git pull && cargo install --path …` (note) |
@@ -416,15 +504,21 @@ For every non-SelfContained channel, `fresh update`:
 
 1. Confirms an update exists.
 2. Builds the exact command from the registry + `hints`.
-3. Either **runs it** (default when the tool is on `PATH` and no elevation is
-   needed, e.g. `brew upgrade`, `flatpak update`, `winget upgrade`) after a
-   confirmation prompt, or **prints it** for the user to run (when it needs
-   `sudo`/admin, or the tool isn't found). We never invoke `sudo` ourselves.
+3. **Runs it**, after the user picks "Update now" — including when it needs
+   root, in which case it is prefixed with `sudo` and the password prompt
+   appears in the update terminal. "Show the command" prints it instead.
+   `--print-command` is the CLI spelling of that choice.
 4. Never touches the binary directly — the manager does, keeping its package DB
    and signatures intact.
 
-AUR is special-cased: detect the installed helper (`yay`, `paru`, else
-`makepkg`) exactly as `install.sh` already does, and template the command.
+AUR is the one channel whose identity does *not* imply a tool: it means
+`pacman` + `makepkg`, not any particular helper. It uses exactly one command —
+`git clone` + `makepkg --syncdeps --install` — on every machine. Preferring
+`yay`/`paru` when present was tried and removed: it made the upgrade mechanism a
+property of the machine rather than of the proved provenance, so two users with
+identical receipts would update by different routes and neither route could be
+predicted from the receipt. It is not separately elevated: `makepkg -si` invokes
+`sudo` itself for the `pacman` step, and wrapping it would nest prompts.
 
 ---
 
@@ -459,9 +553,18 @@ non-goal on silent installs.
   `services::http`.
 - **Integrity:** SHA-256 comparison against the published `.sha256` **and**
   GitHub artifact-attestation verification before any swap. Fail-closed.
-- **No privilege escalation by the editor.** Delegated commands that need root
-  are printed, not run. Self-swap only ever writes files the current user
-  already owns (that's precisely what `self_update=true` asserts).
+- **Privilege escalation is consented and visible, never silent.** Commands that
+  need root run as `sudo` **in the interactive update terminal**, so the
+  password prompt is the user's own shell prompt and they can see exactly what is
+  being run. We never cache credentials, never pass a password, and never
+  elevate without the user having picked "Update now" for that specific update.
+  Every popup with a privileged step says so before it is taken, and "Show the
+  command" prints it instead for anyone who would rather run it themselves.
+  This supersedes the earlier "print, never run" rule: that rule did not remove
+  the root command, it just moved it somewhere the user got no help with, and
+  the editor's own indicator then had to lie about whether an update happened.
+  Self-swap is unchanged — it only ever writes files the current user already
+  owns (precisely what `self_update=true` asserts) and is never elevated.
 - **Downgrade protection:** refuse to "update" to a version `<= current` unless
   `--allow-downgrade` is passed.
 - **Receipt trust:** packaged receipts are read-only, manager-owned. A
@@ -608,10 +711,40 @@ installs point at the releases page instead of prompting.
 
 The result is surfaced on the **indicator**, not a transient status message
 (which would scroll away and can't relay a "restart now" cue). App state
-carries a `SelfUpdatePhase` (`Idle`/`Running`/`Succeeded`/`Failed`); on launch
-it flips to `Running` (indicator: `Updating…`), and a watcher thread reaps the
-child and posts `AsyncMessage::SelfUpdateFinished { success }`, moving the
-indicator to `Updated — restart fresh` or `Update failed — click for log`.
+carries a `SelfUpdatePhase` with **three** terminal states, because
+`fresh --cmd update` has three outcomes, not two:
+
+| Child exit | Phase | Indicator |
+|---|---|---|
+| `0` | `Succeeded` | `Updated — restart fresh` |
+| `EXIT_ACTION_REQUIRED` (2) | `ActionRequired` | `Update needs a command — click for details` |
+| anything else | `Failed` | `Update failed — click for details` |
+
+The third state exists because two channel groups legitimately end with the
+update *not* applied and nothing having gone wrong: `DownloadPackage` channels
+that need root (`dpkg -i`, `rpm -U`) download and verify the package and then
+stop, and `Delegated`/`Toolchain` channels whose command we only print. Folding
+those into the pair produced a wrong indicator in both directions — the
+privileged path exited 1 and read as "Update failed" when nothing had failed,
+and the print-only path exited 0 and read as "Updated — restart fresh" when
+nothing had been installed. `UpdateStatus::ActionRequired` and the distinct
+exit code are what keep them apart.
+
+On launch the phase flips to `Running` (indicator: `Updating…`), and the
+terminal's exit code is mapped by `SelfUpdatePhase::from_exit_code`.
+
+Clicking the indicator is state-dependent: `Failed` offers retry / show-log,
+`ActionRequired` surfaces the pending command (it does **not** re-offer an
+update that has already been downloaded and verified), and `Running` /
+`Succeeded` jump to the update output.
+
+The confirmation prompt itself is built from the resolved `UpdatePlan` rather
+than being one fixed row, since "Update to vX" means five different things
+across the channels. `app::update_prompt::offer_for` maps the plan to an
+`UpdateOffer` — in-place swap, download-and-install, download-then-hand-over,
+run-the-command, show-the-command, or nothing-we-can-do — and the popup states
+which one applies **before** the user confirms. For the offers that leave a
+root command behind, the body says so up front.
 Once a run has started, clicking the indicator — or the **"Open update log"**
 command (`Action::OpenUpdateLog`) — opens the log via `open_local_file`, i.e.
 from the machine `fresh` runs on, never the window's (possibly remote)
@@ -650,11 +783,18 @@ SHA-256, and an optional no-prompt `auto_update` mode.
    cargo — Toolchain would be nicer).
 3. **Attestation verification offline / air-gapped:** provide a
    `--skip-attestation` (checksum-only) escape hatch, clearly warned.
-4. **mise/asdf** manage their own shims; confirm `mise upgrade fresh` is the
-   right invocation and that a receipt even makes sense there (mise may prefer
-   we stay `Unknown` → Manual).
-5. **Snap/Chocolatey** are listed as planned; receipts are specified but the
-   channels ship only once those pipelines exist.
+4. **mise/asdf** manage their own shims. The invocation is now
+   `mise upgrade github:sinelaw/fresh` (the tool ref, matching the README's
+   `mise use`); a bare `fresh` matched nothing. Nothing writes a `mise` receipt
+   yet, so the channel is unreachable in practice — resolved as latent, not
+   fixed by observation.
+5. **Snap/Scoop/Chocolatey/zypper/pacman** have no pipeline, so nothing writes
+   their receipts and no heuristic resolves to them — they are unreachable, and
+   §6 now routes them to `Manual` rather than naming an invented command. Their
+   `Channel` variants are kept because the ids are receipt wire format, so a
+   receipt written by a future pipeline still parses. **Open:** whether to drop
+   the variants outright once it is clear those pipelines will not ship. That is
+   a wire-format change and needs a deliberate call, not a cleanup.
 6. **Two binaries, one machine** (e.g. a brew `fresh` and a cargo `fresh`): the
    receipt is resolved relative to `current_exe()`, so each updates itself
    correctly — this is a feature of anchoring on the executable path, not the

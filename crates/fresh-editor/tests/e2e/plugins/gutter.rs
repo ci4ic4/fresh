@@ -101,17 +101,14 @@ fn process_async_once(harness: &mut EditorTestHarness) {
     let _ = harness.process_async_and_render();
 }
 
-/// Trigger the Git Gutter Refresh command via command palette
+/// Trigger the Git Gutter Refresh command via command palette.
+///
+/// Goes through `run_palette_command` rather than typing and pressing Enter:
+/// the command is registered by the git_gutter *plugin*, so until the plugin
+/// has loaded there is no row to activate, and Quick Open only re-filters on
+/// input change. Pressing Enter blind either runs some other command or none.
 fn trigger_git_gutter_refresh(harness: &mut EditorTestHarness) {
-    harness
-        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
-        .unwrap();
-    harness.render().unwrap();
-    harness.type_text("Git Gutter").unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
-    harness.render().unwrap();
+    harness.run_palette_command("Git Gutter").unwrap();
 }
 
 /// Open a file using the harness's open_file method
@@ -272,28 +269,42 @@ fn test_git_gutter_updates_after_save() {
     open_file(&mut harness, &repo.path, "src/main.rs");
     harness.render().unwrap();
 
-    // Wait for git gutter to stabilize - for an unmodified file, there should be
-    // 0 indicators. We need to wait because the git diff is async and might not
-    // have completed yet (or might show transient indicators during loading).
     harness
         .wait_until(|h| {
-            // Process async messages to allow git gutter to settle
             let screen = h.screen_to_string();
-            // For unmodified file, should have 0 indicators once stabilized
-            // But we also accept any stable state for robustness
             screen.contains("main.rs") && screen.contains("fn main")
         })
         .unwrap();
 
-    // Give git gutter extra time to settle since git diff is async
-    for _ in 0..5 {
-        harness.process_async_and_render().unwrap();
-        harness.sleep(std::time::Duration::from_millis(50));
-    }
+    // Let the plugin's open-time pass finish before touching the buffer.
+    //
+    // This is load-bearing, and not for the reason it looks like: the plugin
+    // establishes its HEAD baseline for the file asynchronously on open, and
+    // editing before that lands leaves it without one — after the save it
+    // then never produces indicators at all, and any wait for one hangs to
+    // the external timeout.
+    //
+    // It used to be spelled `for _ in 0..5 { …; harness.sleep(50ms) }`, which
+    // reads as a 250 ms pause and is not one: `harness.sleep` advances
+    // *logical* time only (see its doc comment), so the loop's five
+    // `process_async_and_render` calls were the entire effect and the pause
+    // was zero. Waiting for the async pipeline to actually go quiet is the
+    // same intent, made real — and it is the helper written for precisely
+    // this case, plugin decorations produced off-thread.
+    harness.wait_for_async_quiescence(3).unwrap();
 
-    // Initially, there should be no git gutter indicators (file matches HEAD)
-    let screen = harness.screen_to_string();
-    let initial_indicators = count_gutter_indicators(&screen, "│");
+    // For an unmodified file the settled state is no indicators at all.
+    // Asserting that beats sampling a baseline count to compare against
+    // later: the old code captured `initial_indicators` off whatever frame
+    // the async diff happened to have reached, and if that sample caught the
+    // settled count rather than the pre-diff one, the later `count > initial`
+    // could never be satisfied — a 180 s timeout rather than a failure.
+    assert_eq!(
+        count_gutter_indicators(&harness.screen_to_string(), "│"),
+        0,
+        "a file matching HEAD should have no gutter indicators once settled\nScreen:\n{}",
+        harness.screen_to_string()
+    );
 
     // Make a change
     harness.type_text("// New comment\n").unwrap();
@@ -302,23 +313,31 @@ fn test_git_gutter_updates_after_save() {
     // Save the file - this should trigger git gutter update
     save_file(&mut harness);
 
-    // Wait for git gutter to update
-    harness
-        .wait_until(|h| {
-            let screen = h.screen_to_string();
-            // After save, there should be git indicators (file differs from HEAD)
-            count_gutter_indicators(&screen, "│") > initial_indicators
-        })
-        .unwrap();
+    // Wait for the end state: the added line carries a green indicator in
+    // column 0. That holds only once the post-save diff has landed, and a
+    // genuinely wrong result still fails loudly through the wait's periodic
+    // screen dumps.
+    let comment_row = |h: &EditorTestHarness| -> Option<u16> {
+        h.screen_to_string()
+            .lines()
+            .position(|line| line.contains("// New comment"))
+            .map(|row| row as u16)
+    };
+    let indicator_landed = |h: &EditorTestHarness| {
+        let Some(row) = comment_row(h) else {
+            return false;
+        };
+        h.get_row_text(row).starts_with('│')
+            && h.get_cell_style(0, row)
+                .is_some_and(|s| s.fg == Some(Color::Rgb(80, 250, 123)))
+    };
+    harness.wait_until(indicator_landed).unwrap();
 
     let screen = harness.screen_to_string();
     println!("After save screen:\n{}", screen);
 
-    let (row, added_line) = screen
-        .lines()
-        .enumerate()
-        .find(|(_, line)| line.contains("// New comment"))
-        .expect("New comment should be visible after save");
+    let row = comment_row(&harness).expect("New comment should be visible after save");
+    let added_line = harness.get_row_text(row);
     assert_eq!(
         added_line.chars().next(),
         Some('│'),
@@ -326,7 +345,7 @@ fn test_git_gutter_updates_after_save() {
     );
 
     let indicator_style = harness
-        .get_cell_style(0, row as u16)
+        .get_cell_style(0, row)
         .expect("Git gutter indicator cell should have a style");
     assert_eq!(
         indicator_style.fg,
@@ -1701,16 +1720,27 @@ fn test_git_gutter_refreshes_after_external_git_checkout() {
         "a file matching HEAD should have no gutter indicators"
     );
 
-    // Filesystems with 1s mtime granularity need the reset's mtime to land
-    // after the open's recorded mtime, or auto-revert won't see a change.
-    harness.sleep(std::time::Duration::from_millis(2100));
+    // Auto-revert notices the external write by mtime, so the reset's mtime
+    // has to be distinguishable from the one recorded when the file was
+    // opened. Record that floor now, reset, then bump until the filesystem
+    // clock has actually moved past it.
+    //
+    // This used to be `harness.sleep(2100ms)`, which advances *logical* time
+    // only — it waited no real wall-clock at all, so on a filesystem with 1 s
+    // mtime granularity the open and the checkout could land in the same tick,
+    // auto-revert never fired, and the wait below blocked until nextest killed
+    // the test at 180 s.
+    let opened_at = repo.mtime("long.txt");
 
     // Externally reset the file to its v1 state while it is open.
     repo.git_checkout_file("HEAD~1", "long.txt");
+    repo.touch_until_mtime_after("long.txt", opened_at);
 
-    // Auto-revert reloads the buffer from disk.
+    // Auto-revert reloads the buffer from disk. The rewritten lines are near
+    // the top of the file and so on screen — assert on the rendered text
+    // rather than on buffer state (CONTRIBUTING.md Testing §2).
     harness
-        .wait_until(|h| !h.get_buffer_content().unwrap().contains("CHANGED IN HEAD"))
+        .wait_until(|h| !h.screen_to_string().contains("CHANGED IN HEAD"))
         .expect("auto-revert should reload the externally reset file");
 
     // The reverted content differs from HEAD on the two rewritten lines, so

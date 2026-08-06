@@ -54,7 +54,6 @@ default = ["plugins", "runtime", "embed-plugins", "tree-sitter", "http", "self-u
 plugins = [
     "dep:fresh-plugin-runtime",
     "dep:fresh-parser-js",
-    "dep:fresh-plugin-api-macros",
     # oxc parses init.ts, which only the plugin runtime can execute.
     "dep:oxc_allocator",
     "dep:oxc_parser",
@@ -116,13 +115,13 @@ runtime = [
 # telemetry, and the `editor.httpFetch` plugin API. Enabled by default.
 # When disabled, those paths become no-ops / return errors and the whole
 # TLS stack (ureq + rustls + ring + webpki) is dropped from the binary.
-http = ["dep:ureq"]
+http = ["dep:ureq", "fresh-update/net"]
 # In-place self-update for self-contained installs (raw tarball / AppImage):
 # download the release asset, verify its SHA-256, extract, and atomically swap
 # the binary. Needs HTTP plus archive extraction (tar + xz + zip). Enabled by
 # default; dropped from min-size/no-default builds so they stay small and never
 # link the extraction/TLS stack.
-self-update = ["http", "dep:tar", "dep:xz2", "dep:zip"]
+self-update = ["http", "fresh-update/engine"]
 # Web UI: `fresh --web [ADDR]` serves the real editor to a browser over a
 # local HTTP + WebSocket bridge (the `webui` module), hosted inside the session
 # daemon so `fresh -a` can attach a terminal to the same editor. The frontend
@@ -224,9 +223,6 @@ libc = { version = "0.2", optional = true }
 libloading = { version = "0.9", optional = true }
 nix = { version = "0.31", features = ["signal", "pthread", "resource", "poll", "fs"], optional = true }
 
-# Plugin API proc macros for type-safe bindings
-fresh-plugin-api-macros = { workspace = true, optional = true }
-
 # anyhow is always needed for model error handling
 anyhow = { workspace = true }
 # base64 for remote protocol encoding (and the webui WebSocket handshake)
@@ -248,9 +244,6 @@ syntect = { version = "5.3", default-features = false, optional = true }
 
 ureq = { version = "3.1.4", default-features = false, features = ["rustls", "platform-verifier"], optional = true }
 # Archive extraction for self-update (behind the `self-update` feature).
-tar = { version = "0.4", optional = true }
-xz2 = { version = "0.1", optional = true }
-zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 # Unicode handling - always needed for primitives
 unicode-width = { version = "0.2" }
 unicode-segmentation = { version = "1.12" }
