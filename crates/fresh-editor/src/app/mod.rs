@@ -61,6 +61,8 @@ mod plugin_commands;
 mod plugin_dispatch;
 #[cfg(feature = "plugins")]
 mod plugin_offloop;
+#[cfg(feature = "plugins")]
+pub(crate) mod plugin_timers;
 mod popup_actions;
 mod popup_dialogs;
 mod popup_overlay_actions;
@@ -171,6 +173,14 @@ pub fn editor_tick(
         needs_render = true;
     }
     if editor.check_completion_trigger_timer() {
+        needs_render = true;
+    }
+    // Plugin `setInterval` / `setTimeout` fires from the tick rather than
+    // from a promise chain the plugin has to keep alive itself, so a throw in
+    // one handler costs one tick instead of ending the schedule, and unload
+    // can cancel it.
+    #[cfg(feature = "plugins")]
+    if editor.check_plugin_timers() {
         needs_render = true;
     }
     editor.active_window_mut().check_diagnostic_pull_timer();
@@ -376,12 +386,23 @@ pub(crate) const PLUGIN_COMMAND_FRAME_BUDGET: std::time::Duration =
 pub(crate) const DRAIN_MIN_PER_PASS: usize = 8;
 
 /// A single plugin command handler taking longer than this on the editor
-/// thread is a defect: the work belongs in `plugin_offloop`. Logged at WARN
-/// naming the offending variant — see `dispatch_plugin_command_measured` for
-/// why that is a diagnostic rather than a failure, and which test does fail.
+/// thread is over budget: the work belongs in `plugin_offloop`. Logged at
+/// DEBUG naming the offending variant — a handler can cross 50ms on a loaded
+/// machine or a cold cache without anything being wrong, so this is a lead to
+/// follow when profiling, not a complaint aimed at the user. See
+/// `dispatch_plugin_command_measured` for why an overrun is a diagnostic
+/// rather than a failure, and which test does fail.
 #[cfg(feature = "plugins")]
 pub(crate) const PLUGIN_COMMAND_HANDLER_LIMIT: std::time::Duration =
     std::time::Duration::from_millis(50);
+
+/// An overrun this far past `PLUGIN_COMMAND_HANDLER_LIMIT` is a visible stall
+/// — ten frames' worth of editor thread — and no amount of machine noise
+/// explains it. Logged at WARN, so the noisy-but-harmless case stays at DEBUG
+/// while the genuinely broken handler still gets named by default.
+#[cfg(feature = "plugins")]
+pub(crate) const PLUGIN_COMMAND_HANDLER_HARD_LIMIT: std::time::Duration =
+    std::time::Duration::from_millis(500);
 
 /// The main editor struct - manages multiple buffers, clipboard, and rendering
 pub struct Editor {
@@ -950,6 +971,14 @@ pub struct Editor {
     /// request supersedes the old one rather than queueing behind it.
     #[cfg(feature = "plugins")]
     grep_project_cancel: std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>,
+
+    /// Live `editor.setInterval` / `setTimeout` timers, checked once per
+    /// tick by `check_plugin_timers`. Held on the editor rather than in the
+    /// plugin runtime on purpose: the editor's tick is what runs whether or
+    /// not any JS is awaiting, which is the property that makes a timer fire
+    /// the same way regardless of where it was created.
+    #[cfg(feature = "plugins")]
+    plugin_timers: Vec<crate::app::plugin_timers::PluginTimer>,
 
     /// Registered diff baselines (registerDiffBaseline plugin API family).
     /// Shared with off-loop loader tasks; see `app/diff_baselines.rs`.
